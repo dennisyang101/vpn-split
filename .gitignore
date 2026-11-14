@@ -1,0 +1,13 @@
+.DS_Store
+.codegraph/
+*.log
+*.tmp
+.env
+.env.*
+provider.conf
+hosts.txt
+mode
+state
+artifacts/
+__pycache__/
+*.pyc

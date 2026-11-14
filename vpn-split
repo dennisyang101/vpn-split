@@ -1,0 +1,552 @@
+#!/bin/bash
+# IPv4 split routing for macOS point-to-point VPNs. No provider credentials are stored.
+set -uo pipefail
+
+CONF_DIR=${VPN_SPLIT_CONF_DIR:-"$HOME/.config/vpn-split"}
+HOSTS=$CONF_DIR/hosts.txt
+CONFIG=$CONF_DIR/provider.conf
+MODE_FILE=$CONF_DIR/mode
+RUN_DIR=/var/run/vpn-split
+STATE=$RUN_DIR/state
+ROOT_BIN=/Library/PrivilegedHelperTools/local.vpn-split
+PLIST=/Library/LaunchDaemons/local.vpn-split.plist
+SPEED_HOST=speed.cloudflare.com
+HALVES=(0.0.0.0/1 128.0.0.0/1)
+
+fail() { printf 'vpn-split: %s\n' "$*" >&2; return 1; }
+valid_ip() {
+  local part rest=$1
+  [[ $rest =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  while [[ $rest == *.* ]]; do
+    part=${rest%%.*}; rest=${rest#*.}
+    [[ $part == 0 || $part != 0* ]] && ((10#$part <= 255)) || return 1
+  done
+  [[ $rest == 0 || $rest != 0* ]] && ((10#$rest <= 255))
+}
+valid_cidr() {
+  local prefix=${1#*/}
+  [[ $1 == */* && $prefix =~ ^[0-9]{1,2}$ ]] || return 1
+  valid_ip "${1%/*}" && ((10#$prefix <= 32))
+}
+valid_domain() {
+  local part rest=$1
+  [[ ${#1} -le 253 && $1 == *.* && ! $1 =~ ^[0-9.]+$ ]] || return 1
+  while :; do
+    part=${rest%%.*}
+    [[ ${#part} -le 63 && $part =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+    [[ $rest == *.* ]] || break
+    rest=${rest#*.}
+  done
+}
+normalize() {
+  local value=$1
+  value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+  if [[ $value == http://* || $value == https://* ]]; then
+    value=${value#*://}; value=${value%%[/?#]*}; value=${value%%:*}
+  fi
+  if valid_ip "$value" || valid_cidr "$value" || valid_domain "$value"; then
+    printf '%s\n' "$value"
+  else
+    fail "無效的網域、IPv4 或 CIDR：$1"
+  fi
+}
+canonical() {
+  local ip=${1%/*} prefix=${1#*/} a b c d n mask
+  valid_ip "$1" && { printf '%s/32\n' "$1"; return; }
+  valid_cidr "$1" || return 1
+  IFS=. read -r a b c d <<< "$ip"
+  n=$(((10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d))
+  prefix=$((10#$prefix)); mask=$(((4294967295 << (32-prefix)) & 4294967295)); n=$((n & mask))
+  printf '%d.%d.%d.%d/%d\n' "$(((n >> 24) & 255))" "$(((n >> 16) & 255))" "$(((n >> 8) & 255))" "$((n & 255))" "$prefix"
+}
+parse_entries() {
+  local line value
+  while IFS= read -r line || [[ -n $line ]]; do
+    value=${line%%#*}; value=${value//[[:space:]]/}
+    [[ -z $value ]] && continue
+    normalize "$value" 2>/dev/null || { fail '清單包含無效項目，請檢查 hosts.txt'; return 1; }
+  done
+}
+entries() {
+  local result
+  [[ -f $HOSTS ]] || return 0
+  exec 9< "$HOSTS" || return
+  # Inspect the opened file, not just its pathname, to close the symlink-swap race.
+  if ((EUID == 0)) && [[ -z ${VPN_SPLIT_UID:-} || $(stat -L -f %u /dev/fd/9) != "$VPN_SPLIT_UID" ]]; then
+    exec 9<&-; fail '清單擁有者不符'; return 1
+  fi
+  parse_entries <&9; result=$?
+  exec 9<&-
+  return "$result"
+}
+mode() {
+  local value=''
+  if [[ -f $MODE_FILE ]]; then
+    exec 8< "$MODE_FILE" || return
+    if ((EUID == 0)) && [[ -z ${VPN_SPLIT_UID:-} || $(stat -L -f %u /dev/fd/8) != "$VPN_SPLIT_UID" ]]; then
+      exec 8<&-; fail '模式檔擁有者不符'; return 1
+    fi
+    IFS= read -r value <&8 || :
+    exec 8<&-
+  fi
+  [[ $value == full ]] && printf 'full\n' || printf 'split\n'
+}
+config_get() {
+  local key=$1 line
+  [[ -f $CONFIG ]] || { [[ $key != kind ]] || printf 'manual\n'; return 0; }
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ ${line%%=*} == "$key" && $line == *=* ]]; then printf '%s\n' "${line#*=}"; return; fi
+  done < "$CONFIG"
+}
+validate_config() {
+  local line key seen=' ' kind path
+  if [[ -f $CONFIG ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ -z $line || $line == \#* ]] && continue
+      [[ $line == *=* && $line != *$'\r'* ]] || { fail '設定格式錯誤'; return 1; }
+      key=${line%%=*}
+      case $key in kind|service|start|stop) ;; *) fail "未知設定：$key"; return 1;; esac
+      [[ $seen != *" $key "* ]] || { fail "重複設定：$key"; return 1; }
+      seen="$seen$key "
+    done < "$CONFIG"
+  fi
+  kind=$(config_get kind)
+  case $kind in
+    manual) ;;
+    scutil) path=$(config_get service); [[ -n $path && ${#path} -le 128 && $path != -* && $path != *'|'* ]] || { fail '無效的 VPN service'; return 1; };;
+    hooks)
+      for key in start stop; do
+        path=$(config_get "$key")
+        [[ $path == /* && -f $path && -x $path ]] || { fail 'Hook 必須為絕對路徑的可執行檔'; return 1; }
+      done;;
+    *) fail 'Provider 必須為 manual、scutil 或 hooks'; return 1;;
+  esac
+}
+cmd_config() {
+  local tmp saved=$CONFIG
+  if (($# == 0)); then
+    if [[ -f $CONFIG ]]; then /bin/cat "$CONFIG"; else printf 'kind=manual\n'; fi
+    return
+  fi
+  mkdir -p "$CONF_DIR" || return
+  tmp=$(mktemp "$CONF_DIR/provider.XXXXXX") || return
+  case $1 in
+    manual) [[ $# == 1 ]] || { rm -f "$tmp"; return 1; }; printf 'kind=manual\n' > "$tmp";;
+    scutil) [[ $# == 2 && $2 != *$'\n'* ]] || { rm -f "$tmp"; return 1; }; printf 'kind=scutil\nservice=%s\n' "$2" > "$tmp";;
+    hooks) [[ $# == 3 && $2 != *$'\n'* && $3 != *$'\n'* ]] || { rm -f "$tmp"; return 1; }; printf 'kind=hooks\nstart=%s\nstop=%s\n' "$2" "$3" > "$tmp";;
+    *) fail 'config manual | scutil SERVICE | hooks START_PATH STOP_PATH'; rm -f "$tmp"; return 1;;
+  esac
+  CONFIG=$tmp
+  if ! validate_config; then CONFIG=$saved; rm -f "$tmp"; return 1; fi
+  CONFIG=$saved; chmod 600 "$tmp" && mv "$tmp" "$CONFIG"
+}
+provider_action() {
+  local action=$1 key
+  ((EUID != 0)) || { fail 'VPN 連線操作必須以一般使用者執行'; return 1; }
+  validate_config || return
+  case $(config_get kind) in
+    manual) fail '請在 VPN 客戶端操作連線，或先設定 scutil / hooks'; return 1;;
+    scutil) scutil --nc "$action" "$(config_get service)";;
+    hooks) [[ $action == start ]] && key=start || key=stop; "$(config_get "$key")";;
+  esac
+}
+cmd_edit() {
+  local action=$1 raw val tmp line check list
+  shift; (($# > 0)) || { fail "$action 需要至少一個項目"; return 1; }
+  for raw; do normalize "$raw" >/dev/null || return; done
+  mkdir -p "$CONF_DIR" || return
+  [[ -f $HOSTS ]] || : > "$HOSTS"
+  for raw; do
+    val=$(normalize "$raw") || return
+    tmp=$(mktemp "$CONF_DIR/hosts.XXXXXX") || return
+    while IFS= read -r line || [[ -n $line ]]; do
+      check=${line%%#*}; check=${check//[[:space:]]/}
+      if [[ $action == remove && -n $check ]] && [[ $(normalize "$check" 2>/dev/null) == "$val" ]]; then continue; fi
+      printf '%s\n' "$line"
+    done < "$HOSTS" > "$tmp"
+    if [[ $action == add ]]; then
+      list=$(entries) || { rm -f "$tmp"; return 1; }
+      if ! grep -qxF "$val" <<< "$list"; then printf '%s\n' "$val" >> "$tmp"; fi
+    fi
+    if ! chmod 600 "$tmp" || ! mv "$tmp" "$HOSTS"; then rm -f "$tmp"; return 1; fi
+    printf '%s: %s\n' "$action" "$val"
+  done
+}
+# Normalize the compressed destinations used by macOS netstat. Output CIDR gateway interface.
+route_table() {
+  netstat -rn -f inet 2>/dev/null | awk '
+    $4 ~ /^[a-z][a-z0-9]*$/ && ($1=="default" || $1 ~ /^[0-9]/) {
+      dest=$1; if(dest=="default")dest="0.0.0.0/0";
+      split(dest,p,"/"); n=split(p[1],a,"."); if(n>4)next;
+      ip=a[1]; for(i=2;i<=4;i++)ip=ip "." (i<=n?a[i]:0);
+      prefix=(p[2]!=""?p[2]:(n==4?32:n*8));
+      print ip "/" prefix, $2, $4
+    }'
+}
+exact_route() {
+  local table
+  table=$(route_table) || { printf 'unknown\n'; return 1; }
+  awk -v d="$1" '$1==d {print $2, $3}' <<< "$table"
+}
+route_iface() { route -n get "$1" 2>/dev/null | awk '/interface:/{print $2; exit}'; }
+iface_for_gw() {
+  ifconfig 2>/dev/null | awk -v g="$1" '/^[a-z]/{i=$1; sub(":$","",i)} index($0,"--> " g " ") && i ~ /^utun[0-9]+$/ {print i}'
+}
+state_get() { [[ ! -f $STATE ]] || awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print}' "$STATE"; }
+tunnel() {
+  local table first second gw iface peers
+  table=$(route_table) || return 1
+  first=$(awk '$1=="0.0.0.0/1" {print $2, $3}' <<< "$table")
+  second=$(awk '$1=="128.0.0.0/1" {print $2, $3}' <<< "$table")
+  if [[ -n $first || -n $second ]]; then
+    [[ -n $first && $first == "$second" && $first != *$'\n'* ]] || return 2
+    read -r gw iface <<< "$first"
+    valid_ip "$gw" && [[ $iface =~ ^utun[0-9]+$ ]] || return 2
+  else
+    gw=$(state_get gw); iface=$(state_get iface)
+    [[ -n $gw && -n $iface ]] || return 1
+  fi
+  peers=$(iface_for_gw "$gw")
+  [[ $peers == "$iface" ]] && ifconfig "$iface" 2>/dev/null | grep -q '<UP,' || return 1
+  printf '%s %s\n' "$gw" "$iface"
+}
+resolve() {
+  dscacheutil -q host -a name "$1" 2>/dev/null | awk '/^ip_address:/{print $2}' | while IFS= read -r ip; do valid_ip "$ip" && printf '%s\n' "$ip"; done | sort -u
+}
+route_add() { route -n add -net "$1" "$2" >/dev/null 2>&1; }
+route_delete() { route -n delete -net "$1" "$2" >/dev/null 2>&1; }
+journal() { printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
+# Journal before mutation. Recovery only touches routes still matching this tunnel's exact gateway/interface.
+restore_routes() {
+  local gw iface target actual failures=0 live=no record tmp
+  [[ -f $STATE ]] || return 0
+  gw=$(state_get gw); iface=$(state_get iface)
+  valid_ip "$gw" && [[ $iface =~ ^utun[0-9]+$ ]] || { fail '無效的路由狀態，保留供人工檢查'; return 1; }
+  if [[ $(iface_for_gw "$gw") == "$iface" ]] && ifconfig "$iface" 2>/dev/null | grep -q '<UP,'; then live=yes; fi
+  # Restore the VPN defaults before removing host routes so rollback cannot expose an accidental gap.
+  for target in "${HALVES[@]}"; do
+    grep -qxF "removed=$target" "$STATE" || continue
+    actual=$(exact_route "$target")
+    if [[ -z $actual && $live == yes ]]; then
+      route_add "$target" "$gw" && [[ $(exact_route "$target") == "$gw $iface" ]] || failures=1
+    elif [[ -n $actual && $actual != "$gw $iface" ]]; then
+      fail "復原衝突：$target 已由其他路由接管"; failures=1
+    fi
+  done
+  ((failures == 0)) || return 1
+  while IFS= read -r record; do
+    [[ $record == owned=* ]] || continue
+    target=${record#*=}; valid_cidr "$target" || { failures=1; continue; }
+    actual=$(exact_route "$target")
+    if [[ $actual == unknown ]]; then failures=1; continue; fi
+    if [[ $actual == "$gw $iface" ]]; then
+      if ! route_delete "$target" "$gw"; then failures=1; continue; fi
+      actual=$(exact_route "$target")
+      [[ $actual != unknown && $actual != "$gw $iface" ]] || failures=1
+    fi
+  done < "$STATE"
+  ((failures == 0)) || { fail '路由尚未完全復原，狀態已保留'; return 1; }
+  tmp=$STATE.restored
+  printf 'gw=%s\niface=%s\napplied=full\n' "$gw" "$iface" > "$tmp" && chmod 644 "$tmp" && mv "$tmp" "$STATE"
+}
+build_targets() {
+  local host ip
+  entries >/dev/null || return
+  while IFS= read -r host; do
+    if valid_ip "$host" || valid_cidr "$host"; then canonical "$host"
+    else
+      ip=$(resolve "$host")
+      [[ -n $ip ]] || { fail "網域解析失敗：$host，保留 VPN 原路由"; return 1; }
+      while IFS= read -r host; do canonical "$host"; done <<< "$ip"
+    fi
+  done < <(entries)
+}
+route_conflicts() {
+  local target=$1 gw=$2 iface=$3 table
+  table=$(route_table) || return 1
+  awk -v target="$target" -v gw="$gw" -v iface="$iface" '
+    function ipnum(s, a) {split(s,a,"."); return ((a[1]*256+a[2])*256+a[3])*256+a[4]}
+    BEGIN {split(target,t,"/"); size=2^(32-t[2]); base=int(ipnum(t[1])/size)*size}
+    {split($1,r,"/"); n=ipnum(r[1]); if(r[2]>=t[2] && n>=base && n<base+size && ($2!=gw || $3!=iface)) {bad=1}}
+    END {exit bad}' <<< "$table"
+}
+apply_split() {
+  local gw=$1 iface=$2 targets target actual old_targets tmp direct direct_gw direct_iface
+  entries >/dev/null || return 1
+  direct=$(exact_route 0.0.0.0/0)
+  read -r direct_gw direct_iface <<< "$direct"
+  if [[ -z $direct || $direct == *$'\n'* || -z $direct_gw || -z $direct_iface || $direct_iface == utun* ]]; then
+    fail '缺少單一非 VPN 的原始 default 路由，拒絕分流'; return 1
+  fi
+  targets=$(build_targets) || return 1
+  targets=$(sort -u <<< "$targets")
+  if [[ -f $STATE && $(state_get applied) == pending ]]; then restore_routes || return; fi
+  # A default route entry defeats split mode. Use full mode explicitly instead.
+  if grep -Eq '^(0\.0\.0\.0/0|0\.0\.0\.0/1|128\.0\.0\.0/1)$' <<< "$targets"; then
+    fail '清單不可包含預設路由 /0 或 VPN 的原始 /1 路由'; return 1
+  fi
+  if [[ -f $STATE ]]; then
+    [[ $(state_get gw) == "$gw" && $(state_get iface) == "$iface" ]] || { restore_routes || return; rm -f "$STATE"; }
+  fi
+  if [[ -f $STATE && $(state_get applied) == split ]]; then
+    old_targets=$(state_get desired | sort -u)
+    if [[ $old_targets == "$targets" ]]; then
+      local intact=yes
+      while IFS= read -r target; do
+        [[ -z $target || $(exact_route "$target") == "$gw $iface" ]] || intact=no
+      done <<< "$old_targets"
+      if [[ $intact == yes && -z $(exact_route "${HALVES[0]}") && -z $(exact_route "${HALVES[1]}") ]]; then return 0; fi
+    fi
+    restore_routes || return
+  fi
+  # Never overwrite pre-existing routes, even ones that happen to use the VPN.
+  for target in $targets; do
+    route_conflicts "$target" "$gw" "$iface" || { fail "目標包含其他路由：$target"; return 1; }
+    actual=$(exact_route "$target")
+    [[ -z $actual || $actual == "$gw $iface" ]] || { fail "路由衝突：$target"; return 1; }
+  done
+  for target in "${HALVES[@]}"; do
+    [[ $(exact_route "$target") == "$gw $iface" ]] || { fail '需要同一 VPN 的兩條互補 /1 路由'; return 1; }
+  done
+  tmp=$STATE.new
+  printf 'gw=%s\niface=%s\napplied=pending\n' "$gw" "$iface" > "$tmp" || return
+  chmod 644 "$tmp" && mv "$tmp" "$STATE" || return
+  for target in $targets; do
+    journal desired "$target" || { restore_routes; return 1; }
+    [[ -z $(exact_route "$target") ]] || continue
+    journal owned "$target" || { restore_routes; return 1; }
+    if ! route_add "$target" "$gw" || [[ $(exact_route "$target") != "$gw $iface" ]]; then
+      fail "新增路由失敗：$target"; restore_routes; return 1
+    fi
+  done
+  for target in "${HALVES[@]}"; do
+    journal removed "$target" || { restore_routes; return 1; }
+    if ! route_delete "$target" "$gw" || [[ -n $(exact_route "$target") ]]; then
+      fail "移除 VPN 預設路由失敗：$target"; restore_routes; return 1
+    fi
+  done
+  tmp=$STATE.applied
+  if ! grep -v '^applied=' "$STATE" > "$tmp" || ! printf 'applied=split\n' >> "$tmp" || ! chmod 644 "$tmp" || ! mv "$tmp" "$STATE"; then
+    restore_routes; return 1
+  fi
+}
+secure_run_dir() {
+  [[ ! -L $RUN_DIR ]] || { fail '狀態資料夾不可為符號連結'; return 1; }
+  if [[ ! -e $RUN_DIR ]]; then (umask 022; mkdir "$RUN_DIR") || return; fi
+  [[ -d $RUN_DIR && $(stat -f %u "$RUN_DIR") == 0 && $(stat -f %Lp "$RUN_DIR") == 755 ]] || { fail '狀態資料夾必須為 root 擁有且權限 755'; return 1; }
+  [[ ! -L $STATE && ! -L $STATE.new && ! -L $STATE.restored && ! -L $STATE.applied ]] || return 1
+  [[ ! -e $STATE || $(stat -f %u "$STATE") == 0 ]] || return 1
+}
+secure_config() {
+  local uid=${VPN_SPLIT_UID:-} path owner permissions
+  [[ $uid =~ ^[0-9]+$ && $uid != 0 && $CONF_DIR == /* ]] || { fail '缺少受信任的設定擁有者 UID'; return 1; }
+  path=$CONF_DIR
+  while :; do
+    [[ -d $path && ! -L $path ]] || { fail "設定資料夾不可為符號連結：$path"; return 1; }
+    owner=$(stat -f %u "$path") || return
+    permissions=$(stat -f %Lp "$path") || return
+    [[ $permissions =~ ^[0-7]{3,4}$ && ( $owner == "$uid" || $owner == 0 ) ]] || return 1
+    (( (8#$permissions & 0022) == 0 )) || { fail "設定資料夾可由其他使用者寫入：$path"; return 1; }
+    [[ $path != / ]] || break
+    path=$(dirname "$path")
+  done
+  for path in "$HOSTS" "$MODE_FILE"; do
+    [[ -e $path || -L $path ]] || continue
+    [[ -f $path && ! -L $path && $(stat -f %u "$path") == "$uid" ]] || { fail '清單與模式必須由指定使用者擁有，且不可為符號連結'; return 1; }
+    permissions=$(stat -f %Lp "$path") || return
+    if [[ ! $permissions =~ ^[0-7]{3,4}$ ]] || (( (8#$permissions & 0022) != 0 )); then fail '清單與模式不可由其他使用者寫入'; return 1; fi
+  done
+}
+daemon_cleanup() { restore_routes || return; rm -f "$RUN_DIR/lock/pid"; rmdir "$RUN_DIR/lock"; }
+cmd_daemon() {
+  local detected gw iface pid current_mode
+  ((EUID == 0)) || { fail 'daemon 需要 root'; return 1; }
+  [[ $(uname) == Darwin ]] || return 1
+  secure_run_dir && secure_config || return
+  if ! mkdir "$RUN_DIR/lock" 2>/dev/null; then
+    [[ -f $RUN_DIR/lock/pid && ! -L $RUN_DIR/lock && ! -L $RUN_DIR/lock/pid ]] || return 1
+    pid=$(<"$RUN_DIR/lock/pid")
+    if [[ ! $pid =~ ^[0-9]+$ ]] || kill -0 "$pid" 2>/dev/null; then fail 'daemon 已在執行或鎖定狀態不明'; return 1; fi
+    rm -f "$RUN_DIR/lock/pid"; rmdir "$RUN_DIR/lock" && mkdir "$RUN_DIR/lock" || return
+  fi
+  printf '%s\n' "$$" > "$RUN_DIR/lock/pid"
+  trap 'exit 0' INT TERM HUP
+  trap 'daemon_cleanup' EXIT
+  # Recover an interrupted transaction before accepting a new plan.
+  [[ ! -f $STATE || $(state_get applied) != pending ]] || restore_routes || return
+  while :; do
+    secure_config || return
+    if detected=$(tunnel); then
+      read -r gw iface <<< "$detected"
+      current_mode=$(mode) || return
+      if [[ $current_mode == full ]]; then restore_routes || return
+      else apply_split "$gw" "$iface" || printf 'vpn-split: 分流未套用，5 秒後重試\n' >&2; fi
+    else
+      restore_routes || return
+      rm -f "$STATE"
+    fi
+    sleep 5
+  done
+}
+cmd_routing_plan() {
+  local detected
+  if ! detected=$(tunnel); then fail '未偵測到支援的互補 /1 point-to-point utun VPN'; return 1; fi
+  printf 'tunnel=%s\nmode=%s\n' "$detected" "$(mode)"
+  build_targets
+}
+# A probe reports its actual remote IP and observed route, never a presumed direct path.
+probe() {
+  local out remote seconds public iface
+  out=$(curl -4 -fsS --max-time 5 -w '\nVS_REMOTE %{remote_ip} %{time_connect}\n' "https://$SPEED_HOST/cdn-cgi/trace" 2>/dev/null) || return 1
+  public=$(awk -F= '$1=="ip"{print $2}' <<< "$out")
+  read -r remote seconds <<< "$(awk '$1=="VS_REMOTE"{print $2,$3}' <<< "$out")"
+  valid_ip "$public" && valid_ip "$remote" && [[ $seconds =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  iface=$(route_iface "$remote")
+  printf '%s %s %s %s\n' "$public" "$remote" "${iface:-unknown}" "$(awk -v n="$seconds" 'BEGIN{printf "%.0f", n*1000}')"
+}
+connected_state() {
+  local result first
+  if tunnel >/dev/null; then printf 'yes\n'; return; fi
+  if [[ $(config_get kind) == scutil ]]; then
+    result=$(scutil --nc status "$(config_get service)" 2>/dev/null) || { printf 'unknown\n'; return; }
+    IFS= read -r first <<< "$result"
+    case $first in Connected) printf 'yes\n';; Disconnected) printf 'no\n';; *) printf 'unknown\n';; esac
+  else printf 'no\n'; fi
+}
+daemon_running() {
+  local pid process
+  [[ -f $RUN_DIR/lock/pid ]] || return 1
+  pid=$(<"$RUN_DIR/lock/pid")
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  # kill -0 returns EPERM to a user inspecting the root daemon. Read process identity instead.
+  process=$(ps -p "$pid" -o uid= -o command= 2>/dev/null) || return 1
+  [[ $process =~ ^[[:space:]]*0[[:space:]] && $process == *" $ROOT_BIN daemon" ]]
+}
+cmd_info() {
+  local detected='' gw='' iface='' public='' remote='' via='' ms='' lan host ip
+  validate_config && entries >/dev/null || return
+  detected=$(tunnel) || :
+  read -r gw iface <<< "$detected" || :
+  read -r public remote via ms <<< "$(probe)" || :
+  lan=$(route_iface default)
+  printf 'connected=%s\niface=%s\nmode=%s\napplied_mode=%s\ndaemon=%s\n' "$(connected_state)" "$iface" "$(mode)" "$(state_get applied | awk 'NF{print; found=1} END{if(!found)print "none"}')" "$(daemon_running && printf running || printf stopped)"
+  printf 'lan_if=%s\nlan_ip=%s\ncurrent_ip=%s\ncurrent_iface=%s\ncurrent_ms=%s\nvpn_ip=%s\n' "$lan" "$(ipconfig getifaddr "$lan" 2>/dev/null || :)" "$public" "$via" "$ms" "$([[ -n $iface && $via == "$iface" ]] && printf '%s' "$public")"
+  while IFS= read -r host; do
+    if valid_ip "$host" || valid_cidr "$host"; then ip=${host%/*}; else ip=$(resolve "$host" | /usr/bin/head -1); fi
+    via=''; [[ -z $ip ]] || via=$(route_iface "$ip")
+    local label=unknown
+    if [[ -n $iface && $via == "$iface" ]]; then label=vpn
+    elif [[ -n $via && $via != utun* ]]; then label=direct; fi
+    printf 'domain=%s %s %s\n' "$host" "$label" "${ip:--}"
+  done < <(entries)
+  return 0
+}
+cmd_status() {
+  local info
+  info=$(cmd_info) || return
+  printf '%s\n' "$info" | awk -F= '
+    $1=="connected"{print "VPN 連線：" $2}
+    $1=="mode"{print "期望模式：" $2}
+    $1=="applied_mode"{print "路由已套用模式：" $2}
+    $1=="daemon"{print "Daemon：" $2}
+    $1=="lan_ip"{print "區網 IP：" ($2!=""?$2:"未知")}
+    $1=="current_ip"{print "目前路徑出口 IP：" ($2!=""?$2:"取得失敗")}
+    $1=="current_iface"{print "目前測試路徑介面：" ($2!=""?$2:"未知")}
+    $1=="current_ms"{print "TCP 連線延遲：" ($2!=""?$2 " ms":"取得失敗")}
+    $1=="vpn_ip"{print "VPN 出口 IP：" ($2!=""?$2:"無已驗證測試路徑")}
+    $1=="domain"{print "清單：" $2}'
+}
+check_host() {
+  local host=$1 out ip code seconds via
+  host=$(normalize "$host") || return
+  if valid_ip "$host" || valid_cidr "$host"; then printf '%s interface=%s\n' "$host" "$(route_iface "${host%/*}")"; return; fi
+  if ! out=$(curl -4 -sS --max-time 6 -o /dev/null -w '%{remote_ip} %{http_code} %{time_total}' "https://$host/" 2>/dev/null); then
+    printf '%s HTTPS=failed\n' "$host"; return 1
+  fi
+  read -r ip code seconds <<< "$out"
+  valid_ip "$ip" && [[ $code =~ ^[1-5][0-9][0-9]$ && $seconds =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  via=$(route_iface "$ip")
+  printf '%s HTTPS=%s remote=%s interface=%s total_ms=%s\n' "$host" "$code" "$ip" "${via:-unknown}" "$(awk -v s="$seconds" 'BEGIN{printf "%.0f",s*1000}')"
+}
+cmd_health() {
+  local host failed=0
+  entries >/dev/null || return
+  while IFS= read -r host; do check_host "$host" || failed=1; done < <(entries)
+  return "$failed"
+}
+cmd_speedtest() {
+  local out bytes seconds remote iface code
+  out=$(curl -4 -fsS --max-time 20 -o /dev/null -w '%{size_download} %{time_total} %{remote_ip} %{http_code}' "https://$SPEED_HOST/__down?bytes=10000000" 2>/dev/null) || { fail '測速失敗，無可用結果'; return 1; }
+  read -r bytes seconds remote code <<< "$out"
+  [[ $bytes =~ ^[0-9]+$ && $seconds =~ ^[0-9]+([.][0-9]+)?$ && $code == 200 ]] && valid_ip "$remote" || return 1
+  iface=$(route_iface "$remote")
+  awk -v b="$bytes" -v s="$seconds" -v i="${iface:-unknown}" 'BEGIN{if(b!=10000000 || s<=0)exit 1; printf "目前路徑 %.1f Mbps，介面 %s，下載 %d bytes，耗時 %.3f s\n",b*8/s/1000000,i,b,s}'
+}
+cmd_install_routing() {
+  local src stage uid conf
+  ((EUID != 0)) || { fail '請以一般使用者呼叫 install-routing，由 sudo 授權系統安裝'; return 1; }
+  [[ $(uname) == Darwin ]] || return 1
+  validate_config && entries >/dev/null || return
+  src=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  uid=$(id -u); conf=$CONF_DIR
+  [[ $conf == /* && $conf != *$'\n'* && $conf != *'<'* && $conf != *'&'* && $conf != *'>'* ]] || { fail '設定路徑含不支援字元'; return 1; }
+  VPN_SPLIT_UID="$uid" secure_config || return
+  stage=$(mktemp -d "${TMPDIR:-/tmp}/vpn-split-install.XXXXXX") || return
+  # No daemon has started yet. All root-executed source is copied, not linked to user files.
+  /bin/cat > "$stage/service.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>local.vpn-split</string>
+<key>ProgramArguments</key><array><string>$ROOT_BIN</string><string>daemon</string></array>
+<key>EnvironmentVariables</key><dict><key>VPN_SPLIT_CONF_DIR</key><string>$conf</string><key>VPN_SPLIT_UID</key><string>$uid</string><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardErrorPath</key><string>/var/log/vpn-split.log</string>
+</dict></plist>
+EOF
+  plutil -lint "$stage/service.plist" >/dev/null || { rm -rf "$stage"; return 1; }
+  printf '即將安裝系統路由服務，VPN 支援時會調整 IPv4 路由。請先確保有獨立復原連線。\n'
+  if [[ -e $PLIST ]]; then sudo launchctl bootout system/local.vpn-split || { rm -rf "$stage"; return 1; }; fi
+  sudo install -d -m 755 -o root -g wheel /Library/PrivilegedHelperTools &&
+    sudo install -S -m 755 -o root -g wheel "$src" "$ROOT_BIN" &&
+    sudo install -m 644 -o root -g wheel "$stage/service.plist" "$PLIST" &&
+    sudo launchctl bootstrap system "$PLIST"
+  local result=$?
+  rm -rf "$stage"
+  ((result == 0)) && printf '路由服務已安裝。UID %s，設定 %s。請執行 doctor 檢查實際套用狀態。\n' "$uid" "$conf"
+  return "$result"
+}
+cmd_uninstall_routing() {
+  ((EUID != 0)) || { fail '請以一般使用者執行 uninstall-routing'; return 1; }
+  if [[ -f $STATE && ! -x $ROOT_BIN ]]; then fail '缺少系統 helper，無法安全復原既有路由'; return 1; fi
+  [[ ! -e $PLIST ]] || sudo launchctl bootout system/local.vpn-split || return
+  # Explicit recovery handles stale journals left after a forced termination.
+  if [[ -x $ROOT_BIN ]]; then sudo "$ROOT_BIN" restore || return; fi
+  sudo rm -f "$PLIST" "$ROOT_BIN"
+}
+usage() {
+  printf '%s\n' 'vpn-split status | info | doctor' 'vpn-split add|remove <domain|URL|IPv4|CIDR> ... | list' 'vpn-split config [manual|scutil SERVICE|hooks START_PATH STOP_PATH]' 'vpn-split connect | disconnect | mode [split|full]' 'vpn-split check DOMAIN | health | speedtest | routing-plan' 'vpn-split install-routing | uninstall-routing' '一般使用者安裝／移除請執行 repo 的 install.command / uninstall.command。'
+}
+main() {
+  local value
+  case ${1:-help} in
+    help|-h|--help) usage;;
+    info) cmd_info;; status) cmd_status;; list|ls) entries;;
+    add|remove|rm) value=$1; [[ $value != rm ]] || value=remove; shift; cmd_edit "$value" "$@";;
+    config) shift; cmd_config "$@";; connect) provider_action start;; disconnect) provider_action stop;;
+    mode) shift; if (($# == 0)); then mode; elif [[ $# == 1 && ( $1 == split || $1 == full ) ]]; then mkdir -p "$CONF_DIR" && printf '%s\n' "$1" > "$MODE_FILE"; else fail 'mode [split|full]'; fi;;
+    check) [[ $# == 2 ]] || return 1; check_host "$2";; health) cmd_health;; speedtest) cmd_speedtest;;
+    routing-plan) cmd_routing_plan;; daemon) cmd_daemon;;
+    restore)
+      ((EUID == 0)) && secure_run_dir || return 1
+      if daemon_running; then fail '請先停止路由服務，再執行復原'; return 1; fi
+      restore_routes;;
+    install-routing) cmd_install_routing;; uninstall-routing) cmd_uninstall_routing;;
+    doctor) validate_config && entries >/dev/null || return; printf 'provider=%s\nconnected=%s\n' "$(config_get kind)" "$(connected_state)"; printf 'daemon=%s\napplied_mode=%s\n' "$(daemon_running && printf running || printf stopped)" "$(state_get applied)"; cmd_routing_plan;;
+    *) usage >&2; return 2;;
+  esac
+}
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  if ((EUID == 0)); then export PATH=/usr/bin:/bin:/usr/sbin:/sbin; fi
+  main "$@"
+fi
