@@ -126,6 +126,18 @@ printf 'default 192.0.2.1 UGScg en0\\ndefault link#21 UCSIg bridge100 !\\n0/1 10
 ''')
         self.assertEqual(self.source("exact_route 0.0.0.0/0").stdout, "192.0.2.1 en0\n")
 
+    def test_waits_for_launchd_to_unload_before_reinstall(self):
+        # launchd keeps a booted-out job listed briefly; bootstrapping then fails with EIO.
+        pending = self.base / "pending"
+        self.script("launchctl", f'''[ "$1" = print ] || exit 99
+n=$(cat {shlex.quote(str(pending))}); [ "$n" -gt 0 ] || exit 113
+echo $((n - 1)) > {shlex.quote(str(pending))}''')
+        pending.write_text("3\n")
+        self.source("sleep() { :; }; wait_service_unloaded")
+        self.assertEqual(pending.read_text(), "0\n")
+        pending.write_text("1000\n")
+        self.source("sleep() { :; }; wait_service_unloaded", ok=False)
+
     def test_secure_config_rejects_symlinks_and_writable_files(self):
         self.run_cli("add", "example.org")
         self.source("secure_config")

@@ -483,6 +483,15 @@ cmd_speedtest() {
   iface=$(route_iface "$remote")
   awk -v b="$bytes" -v s="$seconds" -v i="${iface:-unknown}" 'BEGIN{if(b!=10000000 || s<=0)exit 1; printf "目前路徑 %.1f Mbps，介面 %s，下載 %d bytes，耗時 %.3f s\n",b*8/s/1000000,i,b,s}'
 }
+# bootout returns before launchd finishes teardown; bootstrapping the same label meanwhile fails with EIO.
+wait_service_unloaded() {
+  local i
+  for ((i = 0; i < 50; i++)); do
+    launchctl print system/local.vpn-split >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  fail 'launchd 尚未停止舊服務，請稍後重試'
+}
 cmd_install_routing() {
   local src stage uid conf
   ((EUID != 0)) || { fail '請以一般使用者呼叫 install-routing，由 sudo 授權系統安裝'; return 1; }
@@ -507,7 +516,9 @@ cmd_install_routing() {
 EOF
   plutil -lint "$stage/service.plist" >/dev/null || { rm -rf "$stage"; return 1; }
   printf '即將安裝系統路由服務，VPN 支援時會調整 IPv4 路由。請先確保有獨立復原連線。\n'
-  if [[ -e $PLIST ]]; then sudo launchctl bootout system/local.vpn-split || { rm -rf "$stage"; return 1; }; fi
+  if [[ -e $PLIST ]]; then
+    sudo launchctl bootout system/local.vpn-split && wait_service_unloaded || { rm -rf "$stage"; return 1; }
+  fi
   sudo install -d -m 755 -o root -g wheel /Library/PrivilegedHelperTools &&
     sudo install -S -m 755 -o root -g wheel "$src" "$ROOT_BIN" &&
     sudo install -m 644 -o root -g wheel "$stage/service.plist" "$PLIST" &&
