@@ -408,8 +408,10 @@ probe() {
 }
 # Contacted only when the user lists it; its answer counts only if the connection used the tunnel.
 vpn_probe() {
-  local iface=$1 out public remote
-  [[ -n $iface ]] && entries | grep -qxF "$ECHO_HOST" || return 1
+  local iface=$1 out public remote listed
+  [[ -n $iface ]] || return 1
+  listed=$(entries) || return 1
+  grep -qxF "$ECHO_HOST" <<< "$listed" || return 1
   out=$(curl -4 -fsS --max-time 5 -w '\nVS_REMOTE %{remote_ip}\n' "https://$ECHO_HOST" 2>/dev/null) || return 1
   public=$(awk 'NR==1' <<< "$out")
   remote=$(awk '$1=="VS_REMOTE"{print $2}' <<< "$out")
@@ -457,7 +459,7 @@ cmd_info() {
 mode_name() { case $1 in split) printf '分流';; full) printf '全隧道';; *) printf '無';; esac; }
 # Renders cmd_info output. Exit IPs (what remote sites see) are kept apart from listed sites' server IPs.
 render_status() {
-  local info get iface current via ms vpn name path ip width=0 mark
+  local info iface current via ms vpn name path ip width=0 mark
   info=$(cat)
   get() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' <<< "$info"; }
   iface=$(get iface); current=$(get current_ip); via=$(get current_iface); ms=$(get current_ms); vpn=$(get vpn_ip)
@@ -471,7 +473,8 @@ render_status() {
   printf '\n出口 IP（對方看到的你）\n'
   if [[ -z $current ]]; then printf '  目前路徑：取得失敗\n'
   elif [[ -n $iface && $via == "$iface" ]]; then printf '  直連：未測得（測試流量走 VPN）\n'
-  else printf '  直連：%s（%s，延遲 %s ms）\n' "$current" "$via" "$ms"; fi
+  elif [[ $via =~ ^(en|bridge|bond|vlan)[0-9]+$ ]]; then printf '  直連：%s（%s，延遲 %s ms）\n' "$current" "$via" "$ms"
+  else printf '  目前路徑：%s（%s，延遲 %s ms，未確認直連）\n' "$current" "${via:-未知}" "$ms"; fi
   if [[ -z $iface ]]; then printf '  VPN：未連線\n'
   elif [[ -z $vpn ]]; then printf '  VPN：未測得（清單加入 api.ipify.org 即可顯示）\n'
   elif [[ $via == "$iface" ]]; then printf '  VPN：%s（%s，延遲 %s ms）\n' "$vpn" "$iface" "$ms"
@@ -517,12 +520,28 @@ cmd_speedtest() {
 }
 # bootout returns before launchd finishes teardown; bootstrapping the same label meanwhile fails with EIO.
 wait_service_unloaded() {
-  local i
+  local i status
   for ((i = 0; i < 50; i++)); do
-    launchctl print system/local.vpn-split >/dev/null 2>&1 || return 0
-    sleep 0.2
+    if launchctl print system/local.vpn-split >/dev/null 2>&1; then
+      sleep 0.2
+    else
+      status=$?
+      ((status == 113)) && return 0
+      fail "無法確認 launchd 狀態（exit ${status}），保留既有安裝"; return 1
+    fi
   done
   fail 'launchd 尚未停止舊服務，請稍後重試'
+}
+stop_routing_service() {
+  local status
+  if launchctl print system/local.vpn-split >/dev/null 2>&1; then
+    sudo launchctl bootout system/local.vpn-split || return
+    wait_service_unloaded
+  else
+    status=$?
+    ((status == 113)) && return 0
+    fail "無法查詢 launchd 服務（exit ${status}），保留既有安裝"; return 1
+  fi
 }
 cmd_install_routing() {
   local src stage uid conf
@@ -548,9 +567,7 @@ cmd_install_routing() {
 EOF
   plutil -lint "$stage/service.plist" >/dev/null || { rm -rf "$stage"; return 1; }
   printf '即將安裝系統路由服務，VPN 支援時會調整 IPv4 路由。請先確保有獨立復原連線。\n'
-  if [[ -e $PLIST ]]; then
-    sudo launchctl bootout system/local.vpn-split && wait_service_unloaded || { rm -rf "$stage"; return 1; }
-  fi
+  if ! stop_routing_service; then rm -rf "$stage"; return 1; fi
   sudo install -d -m 755 -o root -g wheel /Library/PrivilegedHelperTools &&
     sudo install -S -m 755 -o root -g wheel "$src" "$ROOT_BIN" &&
     sudo install -m 644 -o root -g wheel "$stage/service.plist" "$PLIST" &&
@@ -563,7 +580,7 @@ EOF
 cmd_uninstall_routing() {
   ((EUID != 0)) || { fail '請以一般使用者執行 uninstall-routing'; return 1; }
   if [[ -f $STATE && ! -x $ROOT_BIN ]]; then fail '缺少系統 helper，無法安全復原既有路由'; return 1; fi
-  [[ ! -e $PLIST ]] || sudo launchctl bootout system/local.vpn-split || return
+  stop_routing_service || return
   # Explicit recovery handles stale journals left after a forced termination.
   if [[ -x $ROOT_BIN ]]; then sudo "$ROOT_BIN" restore || return; fi
   sudo rm -f "$PLIST" "$ROOT_BIN"

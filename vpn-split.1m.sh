@@ -55,7 +55,8 @@ current=$(get current_ip); via=$(get current_iface); ms=$(get current_ms); vpn=$
 printf '%s\n' '---' '出口 IP（對方看到的你）'
 if [[ -z $current ]]; then printf '目前路徑：取得失敗\n'
 elif [[ -n $iface && $via == "$iface" ]]; then printf '直連：未測得（測試流量走 VPN）\n'
-else printf '直連：%s（%s，延遲 %s ms）\n' "$current" "$via" "$ms"; fi
+elif [[ $via =~ ^(en|bridge|bond|vlan)[0-9]+$ ]]; then printf '直連：%s（%s，延遲 %s ms）\n' "$current" "$via" "$ms"
+else printf '目前路徑：%s（%s，延遲 %s ms，未確認直連）\n' "$current" "${via:-未知}" "$ms"; fi
 if [[ -z $iface ]]; then printf 'VPN：未連線\n'
 elif [[ -z $vpn ]]; then printf 'VPN：未測得（清單加入 api.ipify.org 即可顯示）\n'
 else printf 'VPN：%s（%s）\n' "$vpn" "$iface"; fi

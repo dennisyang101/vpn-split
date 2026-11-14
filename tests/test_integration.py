@@ -128,25 +128,25 @@ if [ "$3" = 192.0.2.80 ]; then printf 'interface: %s\\n' "$ECHO_IFACE"; else pri
 
     def render(self, **fields):
         info = dict(connected="yes", iface="utun4", mode="split", applied_mode="split", daemon="running",
-                    lan_if="en0", lan_ip="192.168.0.192", current_ip="211.22.87.252", current_iface="en0",
-                    current_ms="13", vpn_ip="54.251.65.224")
+                    lan_if="en0", lan_ip="192.0.2.44", current_ip="203.0.113.7", current_iface="en0",
+                    current_ms="13", vpn_ip="198.51.100.99")
         info.update(fields)
         text = "".join(f"{k}={v}\n" for k, v in info.items())
-        text += "domain=dash.example.com vpn 18.139.45.165\ndomain=b.example.org direct 203.0.113.20\n"
+        text += "domain=dash.example.com vpn 192.0.2.80\ndomain=b.example.org direct 203.0.113.20\n"
         return self.source(f"render_status <<< {shlex.quote(text)}").stdout
 
     def test_status_separates_exit_ips_from_site_server_ips(self):
         self.assertEqual(self.render(), """分流：已套用（VPN utun4，背景服務運作中）
 
 出口 IP（對方看到的你）
-  直連：211.22.87.252（en0，延遲 13 ms）
-  VPN：54.251.65.224（utun4）
+  直連：203.0.113.7（en0，延遲 13 ms）
+  VPN：198.51.100.99（utun4）
 
 清單網站（網站 → 伺服器 IP）
-  ✓ VPN   dash.example.com  18.139.45.165
+  ✓ VPN   dash.example.com  192.0.2.80
   ✗ 直連  b.example.org     203.0.113.20
 
-區網 IP：192.168.0.192（en0）
+區網 IP：192.0.2.44（en0）
 """)
 
     def test_status_spells_out_unapplied_state_and_failed_probe(self):
@@ -157,11 +157,22 @@ if [ "$3" = 192.0.2.80 ]; then printf 'interface: %s\\n' "$ECHO_IFACE"; else pri
             self.assertIn(line + "\n", out)
 
     def test_status_labels_probe_through_tunnel_as_vpn(self):
-        out = self.render(mode="full", applied_mode="full", current_iface="utun4", vpn_ip="211.22.87.252")
+        out = self.render(mode="full", applied_mode="full", current_iface="utun4", vpn_ip="203.0.113.7")
         self.assertIn("全隧道：已套用", out)
         self.assertIn("  直連：未測得（測試流量走 VPN）\n", out)
-        self.assertIn("  VPN：211.22.87.252（utun4，延遲 13 ms）\n", out)
+        self.assertIn("  VPN：203.0.113.7（utun4，延遲 13 ms）\n", out)
         self.assertIn("  VPN：未測得（清單加入 api.ipify.org 即可顯示）\n", self.render(vpn_ip=""))
+
+    def test_vpn_probe_handles_large_list_without_sigpipe(self):
+        self.script("curl", "printf '198.51.100.99\\nVS_REMOTE 192.0.2.80\\n'")
+        self.script("route", "printf 'interface: utun7\\n'")
+        out = self.source("entries() { local i; printf '%s\\n' api.ipify.org; for ((i=0;i<12000;i++)); do printf '%s\\n' example.org || return; done; }; vpn_probe utun7")
+        self.assertEqual(out.stdout, "198.51.100.99\n")
+
+    def test_status_does_not_call_another_tunnel_direct(self):
+        out = self.render(current_iface="utun99")
+        self.assertNotIn("  直連：203.0.113.7", out)
+        self.assertIn("  目前路徑：203.0.113.7（utun99", out)
 
     def test_real_tunnel_parser_rejects_mismatched_halves(self):
         self.env["VPN_MODE"] = "supported"
@@ -188,6 +199,24 @@ echo $((n - 1)) > {shlex.quote(str(pending))}''')
         self.assertEqual(pending.read_text(), "0\n")
         pending.write_text("1000\n")
         self.source("sleep() { :; }; wait_service_unloaded", ok=False)
+
+    def test_launchd_query_error_is_not_treated_as_unloaded(self):
+        self.script("launchctl", "exit 99")
+        self.source("wait_service_unloaded", ok=False)
+
+    def test_uninstall_wait_failure_keeps_helper_and_plist(self):
+        self.script("launchctl", "exit 0")
+        plist = self.base / "service.plist"
+        plist.write_text("fixture")
+        self.env["TEST_PLIST"] = str(plist)
+        self.env["TEST_STATE"] = str(self.base / "no-state")
+        code = 'PLIST=$TEST_PLIST; STATE=$TEST_STATE; ROOT_BIN=$HOME/no-helper; sudo() { printf "sudo:%s\\n" "$*" >> "$CALL_LOG"; }; wait_service_unloaded() { printf "wait\\n" >> "$CALL_LOG"; return 1; }; cmd_uninstall_routing'
+        self.source(code, ok=False)
+        log = (self.base / "calls").read_text()
+        self.assertIn("sudo:launchctl bootout", log)
+        self.assertIn("wait\n", log)
+        self.assertNotIn("sudo:rm", log)
+        self.assertTrue(plist.is_file())
 
     def test_secure_config_rejects_symlinks_and_writable_files(self):
         self.run_cli("add", "example.org")
