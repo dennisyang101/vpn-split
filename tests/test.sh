@@ -132,7 +132,7 @@ CURL_MODE=fail; export CURL_MODE
 info=$("$CLI" info 2>/dev/null)
 if contains "$info" "connected=unknown"; then check 0 'info renders scutil state with failed probe'; else check 1 'info renders scutil state with failed probe'; fi
 if contains "$info" "current_ip="; then check 0 'info still emits remote probe field on failure'; else check 1 'info still emits remote probe field on failure'; fi
-if contains "$("$CLI" status 2>/dev/null)" "目前路徑出口 IP：取得失敗"; then check 0 'status renders failed probe'; else check 1 'status renders failed probe'; fi
+if contains "$("$CLI" status 2>/dev/null)" "  目前路徑：取得失敗"; then check 0 'status renders failed probe'; else check 1 'status renders failed probe'; fi
 if ! "$CLI" daemon >/dev/null 2>&1; then check 0 'daemon refuses non-root caller'; else check 1 'daemon refuses non-root caller'; fi
 
 # Probe must report the remote address, observed interface, and latency. HTTP errors and short downloads fail.

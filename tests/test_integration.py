@@ -90,8 +90,8 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         result = subprocess.run([str(ROOT / "vpn-split.1m.sh")], env=self.env,
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("VPN 未連線", result.stdout)
-        self.assertIn("目前出口 IP：取得失敗", result.stdout)
+        self.assertIn("VPN：未連線", result.stdout)
+        self.assertIn("目前路徑：取得失敗", result.stdout)
         for label in ("連線 VPN", "加入網域", "編輯清單", "測速", "HTTPS 健康檢查", "192.0.2.0/24"):
             self.assertIn(label, result.stdout)
         edit = next(line for line in result.stdout.splitlines() if line.startswith("編輯清單"))
@@ -125,6 +125,43 @@ if [ "$3" = 192.0.2.80 ]; then printf 'interface: %s\\n' "$ECHO_IFACE"; else pri
         self.assertIn("vpn_ip=198.51.100.99\n", self.run_cli("info").stdout)
         self.env["ECHO_IFACE"] = "en0"
         self.assertIn("vpn_ip=\n", self.run_cli("info").stdout)
+
+    def render(self, **fields):
+        info = dict(connected="yes", iface="utun4", mode="split", applied_mode="split", daemon="running",
+                    lan_if="en0", lan_ip="192.168.0.192", current_ip="211.22.87.252", current_iface="en0",
+                    current_ms="13", vpn_ip="54.251.65.224")
+        info.update(fields)
+        text = "".join(f"{k}={v}\n" for k, v in info.items())
+        text += "domain=dash.example.com vpn 18.139.45.165\ndomain=b.example.org direct 203.0.113.20\n"
+        return self.source(f"render_status <<< {shlex.quote(text)}").stdout
+
+    def test_status_separates_exit_ips_from_site_server_ips(self):
+        self.assertEqual(self.render(), """分流：已套用（VPN utun4，背景服務運作中）
+
+出口 IP（對方看到的你）
+  直連：211.22.87.252（en0，延遲 13 ms）
+  VPN：54.251.65.224（utun4）
+
+清單網站（網站 → 伺服器 IP）
+  ✓ VPN   dash.example.com  18.139.45.165
+  ✗ 直連  b.example.org     203.0.113.20
+
+區網 IP：192.168.0.192（en0）
+""")
+
+    def test_status_spells_out_unapplied_state_and_failed_probe(self):
+        out = self.render(connected="no", iface="", applied_mode="none", daemon="stopped",
+                          current_ip="", current_iface="", current_ms="", vpn_ip="")
+        for line in ("VPN：未連線", "模式：想要 分流，目前已套用 無", "背景服務：未執行",
+                     "  目前路徑：取得失敗", "  VPN：未連線"):
+            self.assertIn(line + "\n", out)
+
+    def test_status_labels_probe_through_tunnel_as_vpn(self):
+        out = self.render(mode="full", applied_mode="full", current_iface="utun4", vpn_ip="211.22.87.252")
+        self.assertIn("全隧道：已套用", out)
+        self.assertIn("  直連：未測得（測試流量走 VPN）\n", out)
+        self.assertIn("  VPN：211.22.87.252（utun4，延遲 13 ms）\n", out)
+        self.assertIn("  VPN：未測得（清單加入 api.ipify.org 即可顯示）\n", self.render(vpn_ip=""))
 
     def test_real_tunnel_parser_rejects_mismatched_halves(self):
         self.env["VPN_MODE"] = "supported"

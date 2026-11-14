@@ -454,20 +454,40 @@ cmd_info() {
   done < <(entries)
   return 0
 }
+mode_name() { case $1 in split) printf '分流';; full) printf '全隧道';; *) printf '無';; esac; }
+# Renders cmd_info output. Exit IPs (what remote sites see) are kept apart from listed sites' server IPs.
+render_status() {
+  local info get iface current via ms vpn name path ip width=0 mark
+  info=$(cat)
+  get() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' <<< "$info"; }
+  iface=$(get iface); current=$(get current_ip); via=$(get current_iface); ms=$(get current_ms); vpn=$(get vpn_ip)
+  if [[ $(get connected) == yes && $(get mode) == "$(get applied_mode)" && $(get daemon) == running ]]; then
+    printf '%s：已套用（VPN %s，背景服務運作中）\n' "$(mode_name "$(get mode)")" "$iface"
+  else
+    case $(get connected) in yes) printf 'VPN：已連線（%s）\n' "$iface";; no) printf 'VPN：未連線\n';; *) printf 'VPN：狀態不明\n';; esac
+    printf '模式：想要 %s，目前已套用 %s\n' "$(mode_name "$(get mode)")" "$(mode_name "$(get applied_mode)")"
+    printf '背景服務：%s\n' "$([[ $(get daemon) == running ]] && printf 運作中 || printf 未執行)"
+  fi
+  printf '\n出口 IP（對方看到的你）\n'
+  if [[ -z $current ]]; then printf '  目前路徑：取得失敗\n'
+  elif [[ -n $iface && $via == "$iface" ]]; then printf '  直連：未測得（測試流量走 VPN）\n'
+  else printf '  直連：%s（%s，延遲 %s ms）\n' "$current" "$via" "$ms"; fi
+  if [[ -z $iface ]]; then printf '  VPN：未連線\n'
+  elif [[ -z $vpn ]]; then printf '  VPN：未測得（清單加入 api.ipify.org 即可顯示）\n'
+  elif [[ $via == "$iface" ]]; then printf '  VPN：%s（%s，延遲 %s ms）\n' "$vpn" "$iface" "$ms"
+  else printf '  VPN：%s（%s）\n' "$vpn" "$iface"; fi
+  printf '\n清單網站（網站 → 伺服器 IP）\n'
+  while read -r name path ip; do ((${#name} > width)) && width=${#name}; done < <(awk -F= '$1=="domain"{print $2}' <<< "$info")
+  while read -r name path ip; do
+    case $path in vpn) mark='✓ VPN  ';; direct) mark='✗ 直連 ';; *) mark='? 不明 ';; esac
+    printf '  %s %-*s  %s\n' "$mark" "$width" "$name" "$ip"
+  done < <(awk -F= '$1=="domain"{print $2}' <<< "$info")
+  printf '\n區網 IP：%s（%s）\n' "$(get lan_ip)" "$(get lan_if)"
+}
 cmd_status() {
   local info
   info=$(cmd_info) || return
-  printf '%s\n' "$info" | awk -F= '
-    $1=="connected"{print "VPN 連線：" $2}
-    $1=="mode"{print "期望模式：" $2}
-    $1=="applied_mode"{print "路由已套用模式：" $2}
-    $1=="daemon"{print "Daemon：" $2}
-    $1=="lan_ip"{print "區網 IP：" ($2!=""?$2:"未知")}
-    $1=="current_ip"{print "目前路徑出口 IP：" ($2!=""?$2:"取得失敗")}
-    $1=="current_iface"{print "目前測試路徑介面：" ($2!=""?$2:"未知")}
-    $1=="current_ms"{print "TCP 連線延遲：" ($2!=""?$2 " ms":"取得失敗")}
-    $1=="vpn_ip"{print "VPN 出口 IP：" ($2!=""?$2:"無已驗證測試路徑")}
-    $1=="domain"{print "清單：" $2}'
+  render_status <<< "$info"
 }
 check_host() {
   local host=$1 out ip code seconds via

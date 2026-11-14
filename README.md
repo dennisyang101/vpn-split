@@ -95,7 +95,7 @@ vpn-split speedtest
 vpn-split info
 ```
 
-`status` 顯示目前測試路徑的出口 IP、介面與 TCP 連線時間。`check`／`health` 回報實際 HTTPS 連線的 remote IP、HTTP status、路由介面及完整請求耗時。HTTP 403 不會被解讀成「VPN 一定錯誤」。
+`status` 分開顯示「出口 IP」（對方看到的你：直連與 VPN）與「清單網站」（每個網站是否走 VPN 及其伺服器 IP）。`check`／`health` 回報實際 HTTPS 連線的 remote IP、HTTP status、路由介面及完整請求耗時。HTTP 403 不會被解讀成「VPN 一定錯誤」。
 
 `speedtest` 從 Cloudflare 下載 10 MB，回報實際遠端 IP 對應的介面與單次平均下載速度。HTTP／傳輸失敗及未下載完整內容不產生速度結果。它不是線路容量保證，也不是同時執行的雙路徑比較。
 
