@@ -170,9 +170,11 @@ if [ "$3" = 192.0.2.80 ]; then printf 'interface: %s\\n' "$ECHO_IFACE"; else pri
         self.assertEqual(out.stdout, "198.51.100.99\n")
 
     def test_status_does_not_call_another_tunnel_direct(self):
-        out = self.render(current_iface="utun99")
-        self.assertNotIn("  直連：203.0.113.7", out)
-        self.assertIn("  目前路徑：203.0.113.7（utun99", out)
+        for iface in ("utun99", "ipsec0", "unknown", ""):
+            with self.subTest(iface=iface):
+                out = self.render(current_iface=iface)
+                self.assertNotIn("  直連：203.0.113.7", out)
+                self.assertIn("  目前路徑：203.0.113.7", out)
 
     def test_real_tunnel_parser_rejects_mismatched_halves(self):
         self.env["VPN_MODE"] = "supported"
@@ -217,6 +219,22 @@ echo $((n - 1)) > {shlex.quote(str(pending))}''')
         self.assertIn("wait\n", log)
         self.assertNotIn("sudo:rm", log)
         self.assertTrue(plist.is_file())
+
+    def test_missing_service_is_idempotent_but_query_errors_are_not(self):
+        self.script("launchctl", "exit 113")
+        self.source("stop_routing_service")
+        self.assertFalse((self.base / "calls").exists())
+        self.script("launchctl", "exit 99")
+        self.source("stop_routing_service", ok=False)
+        self.assertFalse((self.base / "calls").exists())
+
+    def test_reinstall_wait_timeout_does_not_replace_helper_or_bootstrap(self):
+        self.run_cli("add", "example.org")
+        self.script("launchctl", "exit 0")
+        self.script("sudo", 'printf "%s\\n" "$*" >> "$CALL_LOG"')
+        self.source("sleep() { :; }; cmd_install_routing", ok=False)
+        calls = (self.base / "calls").read_text().splitlines()
+        self.assertEqual(calls, ["launchctl bootout system/local.vpn-split"])
 
     def test_secure_config_rejects_symlinks_and_writable_files(self):
         self.run_cli("add", "example.org")
