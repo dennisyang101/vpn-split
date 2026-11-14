@@ -112,6 +112,20 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         self.env["CURL_MODE"] = "httpfail"
         self.run_cli("speedtest", ok=False)
 
+    def test_vpn_exit_ip_comes_from_listed_echo_host_through_tunnel(self):
+        self.env.update(VPN_MODE="supported", ECHO_IFACE="utun7")
+        self.script("curl", '''case "$*" in
+ *api.ipify.org*) printf 'echo\\n' >> "$CALL_LOG"; printf '198.51.100.99\\nVS_REMOTE 192.0.2.80\\n';;
+ *) printf 'ip=203.0.113.7\\nVS_REMOTE 198.51.100.8 0.025\\n';; esac''')
+        self.script("route", '''[ "$1 $2" = '-n get' ] || exit 99
+if [ "$3" = 192.0.2.80 ]; then printf 'interface: %s\\n' "$ECHO_IFACE"; else printf 'interface: en0\\n'; fi''')
+        self.assertIn("vpn_ip=\n", self.run_cli("info").stdout)
+        self.assertFalse((self.base / "calls").exists(), "echo host must not be contacted unless listed")
+        self.run_cli("add", "api.ipify.org")
+        self.assertIn("vpn_ip=198.51.100.99\n", self.run_cli("info").stdout)
+        self.env["ECHO_IFACE"] = "en0"
+        self.assertIn("vpn_ip=\n", self.run_cli("info").stdout)
+
     def test_real_tunnel_parser_rejects_mismatched_halves(self):
         self.env["VPN_MODE"] = "supported"
         self.assertEqual(self.source("tunnel").stdout.strip(), "10.8.0.1 utun7")

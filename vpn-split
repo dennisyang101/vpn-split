@@ -11,6 +11,7 @@ STATE=$RUN_DIR/state
 ROOT_BIN=/Library/PrivilegedHelperTools/local.vpn-split
 PLIST=/Library/LaunchDaemons/local.vpn-split.plist
 SPEED_HOST=speed.cloudflare.com
+ECHO_HOST=api.ipify.org
 HALVES=(0.0.0.0/1 128.0.0.0/1)
 
 fail() { printf 'vpn-split: %s\n' "$*" >&2; return 1; }
@@ -405,6 +406,16 @@ probe() {
   iface=$(route_iface "$remote")
   printf '%s %s %s %s\n' "$public" "$remote" "${iface:-unknown}" "$(awk -v n="$seconds" 'BEGIN{printf "%.0f", n*1000}')"
 }
+# Contacted only when the user lists it; its answer counts only if the connection used the tunnel.
+vpn_probe() {
+  local iface=$1 out public remote
+  [[ -n $iface ]] && entries | grep -qxF "$ECHO_HOST" || return 1
+  out=$(curl -4 -fsS --max-time 5 -w '\nVS_REMOTE %{remote_ip}\n' "https://$ECHO_HOST" 2>/dev/null) || return 1
+  public=$(awk 'NR==1' <<< "$out")
+  remote=$(awk '$1=="VS_REMOTE"{print $2}' <<< "$out")
+  valid_ip "$public" && valid_ip "$remote" && [[ $(route_iface "$remote") == "$iface" ]] || return 1
+  printf '%s\n' "$public"
+}
 connected_state() {
   local result first
   if tunnel >/dev/null; then printf 'yes\n'; return; fi
@@ -424,14 +435,15 @@ daemon_running() {
   [[ $process =~ ^[[:space:]]*0[[:space:]] && $process == *" $ROOT_BIN daemon" ]]
 }
 cmd_info() {
-  local detected='' gw='' iface='' public='' remote='' via='' ms='' lan host ip
+  local detected='' gw='' iface='' public='' remote='' via='' ms='' vpn_ip='' lan host ip
   validate_config && entries >/dev/null || return
   detected=$(tunnel) || :
   read -r gw iface <<< "$detected" || :
   read -r public remote via ms <<< "$(probe)" || :
+  if [[ -n $iface && $via == "$iface" ]]; then vpn_ip=$public; else vpn_ip=$(vpn_probe "$iface") || :; fi
   lan=$(route_iface default)
   printf 'connected=%s\niface=%s\nmode=%s\napplied_mode=%s\ndaemon=%s\n' "$(connected_state)" "$iface" "$(mode)" "$(state_get applied | awk 'NF{print; found=1} END{if(!found)print "none"}')" "$(daemon_running && printf running || printf stopped)"
-  printf 'lan_if=%s\nlan_ip=%s\ncurrent_ip=%s\ncurrent_iface=%s\ncurrent_ms=%s\nvpn_ip=%s\n' "$lan" "$(ipconfig getifaddr "$lan" 2>/dev/null || :)" "$public" "$via" "$ms" "$([[ -n $iface && $via == "$iface" ]] && printf '%s' "$public")"
+  printf 'lan_if=%s\nlan_ip=%s\ncurrent_ip=%s\ncurrent_iface=%s\ncurrent_ms=%s\nvpn_ip=%s\n' "$lan" "$(ipconfig getifaddr "$lan" 2>/dev/null || :)" "$public" "$via" "$ms" "$vpn_ip"
   while IFS= read -r host; do
     if valid_ip "$host" || valid_cidr "$host"; then ip=${host%/*}; else ip=$(resolve "$host" | /usr/bin/head -1); fi
     via=''; [[ -z $ip ]] || via=$(route_iface "$ip")
