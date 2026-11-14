@@ -173,9 +173,10 @@ cmd_edit() {
   done
 }
 # Normalize the compressed destinations used by macOS netstat. Output CIDR gateway interface.
+# Interface-scoped routes (flag I, e.g. VM bridges) never serve unscoped traffic, so skip them.
 route_table() {
   netstat -rn -f inet 2>/dev/null | awk '
-    $4 ~ /^[a-z][a-z0-9]*$/ && ($1=="default" || $1 ~ /^[0-9]/) {
+    $4 ~ /^[a-z][a-z0-9]*$/ && $3 !~ /I/ && ($1=="default" || $1 ~ /^[0-9]/) {
       dest=$1; if(dest=="default")dest="0.0.0.0/0";
       split(dest,p,"/"); n=split(p[1],a,"."); if(n>4)next;
       ip=a[1]; for(i=2;i<=4;i++)ip=ip "." (i<=n?a[i]:0);

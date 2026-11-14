@@ -119,6 +119,13 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         self.source("tunnel", ok=False)
         self.run_cli("routing-plan", ok=False)
 
+    def test_interface_scoped_defaults_do_not_count_as_default_route(self):
+        # VM/container bridges add ifscope defaults (flag I) beside the real one.
+        self.script("netstat", '''printf 'Routing tables\\nInternet:\\nDestination Gateway Flags Netif Expire\\n'
+printf 'default 192.0.2.1 UGScg en0\\ndefault link#21 UCSIg bridge100 !\\n0/1 10.8.0.1 UGSc utun7\\n'
+''')
+        self.assertEqual(self.source("exact_route 0.0.0.0/0").stdout, "192.0.2.1 en0\n")
+
     def test_secure_config_rejects_symlinks_and_writable_files(self):
         self.run_cli("add", "example.org")
         self.source("secure_config")
