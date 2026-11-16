@@ -525,6 +525,16 @@ speedtest_iface() {
   fi
   printf '%s\n' "$iface"
 }
+# Split mode leaves the tunnel without a default route, so an unlisted speed host is unreachable through it.
+speedtest_tunnel_route() {
+  local iface=$1 ips ip route
+  ips=$(resolve "$SPEED_HOST")
+  [[ -n $ips ]] || { fail "無法解析 $SPEED_HOST"; return 1; }
+  while IFS= read -r ip; do
+    route=$(route -n get -ifscope "$iface" "$ip" 2>/dev/null | awk '/interface:/{print $2; exit}') || :
+    [[ $route == "$iface" ]] || { fail "VPN 隧道沒有通往 $SPEED_HOST 的路由；分流模式請先執行 vpn-split add $SPEED_HOST"; return 1; }
+  done <<< "$ips"
+}
 speedtest_transfer() {
   local kind=$1 iface=$2 out bytes seconds remote code local_ip addr route selected
   out=$(env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY curl -q -4 --noproxy '*' --interface "if!$iface" --connect-timeout 5 --max-time 20 -fsS -o /dev/null -w '%{size_download} %{time_total} %{remote_ip} %{http_code} %{local_ip}' "https://$SPEED_HOST/__down?bytes=10000000" 2>/dev/null) || { fail '測速失敗，無可用結果'; return 1; }
@@ -546,6 +556,7 @@ cmd_speedtest() {
   kind=${1:-direct}
   [[ $kind == direct || $kind == vpn ]] || { fail 'speedtest [direct|vpn]'; return 2; }
   iface=$(speedtest_iface "$kind") || return 1
+  [[ $kind == direct ]] || speedtest_tunnel_route "$iface" || return 1
   speedtest_transfer "$kind" "$iface"
 }
 # bootout returns before launchd finishes teardown; bootstrapping the same label meanwhile fails with EIO.

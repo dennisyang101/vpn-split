@@ -251,6 +251,17 @@ exit "$SPEED_ROUTE_EXIT"''')
                 self.assertNotIn("Mbps", result.stdout)
                 self.assertFalse((self.base / "speed-done").exists())
 
+    def test_vpn_speedtest_requires_tunnel_route_to_speed_host(self):
+        self.speed_fixtures()
+        for overrides in ({"SPEED_ROUTE_IFACE": "", "SPEED_ROUTE_EXIT": "1"}, {"SPEED_ROUTE_IFACE": "en0"}):
+            with self.subTest(overrides=overrides):
+                self.env.update(VPN_MODE="supported", SPEED_ROUTE_IFACE="utun7", SPEED_ROUTE_EXIT="0")
+                self.env.update(overrides)
+                (self.base / "speed-done").unlink(missing_ok=True)
+                result = self.run_cli("speedtest", "vpn", ok=False)
+                self.assertIn("vpn-split add speed.cloudflare.com", result.stderr)
+                self.assertFalse((self.base / "speed-done").exists())
+
     def test_speedtest_rejects_invalid_transfers_without_fallback(self):
         self.speed_fixtures()
         for output, exit_code in (("10000000 2 198.51.100.8 503 192.0.2.44", "0"),
