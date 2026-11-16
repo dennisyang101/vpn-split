@@ -44,6 +44,14 @@ vpn-split speedtest direct # 直連介面下載 10 MB
 vpn-split speedtest vpn    # VPN utun 介面下載 10 MB（須有有效連線）
 ```
 
+分流模式下執行 VPN 測速前，先將測速站加入清單：
+
+```bash
+vpn-split add speed.cloudflare.com
+```
+
+等分流服務套用路由後，再執行 `vpn-split speedtest vpn`。只有 VPN 已連線還不夠，隧道也必須有通往測速站的路由；缺少路由時，程式會停止並提示加入清單，不會自動新增網域、修改路由或退回直連。不帶參數的 `vpn-split speedtest` 預設測直連。
+
 兩種測速各自固定下載 10 MB，計算單次下載的平均速度，不代表線路峰值。測速會明確綁定選定介面；直連測速只接受唯一、可確認的非 VPN 預設介面，VPN 測速只接受有效的 utun 隧道，驗證失敗不會改走其他路徑。curl proxy 環境變數與 `.curlrc` 不會套用；DNS 仍使用系統解析器，因此這不是 DNS 綁定或防洩漏功能。測速不修改路由或 VPN 設定。
 
 也可從選單列操作，或直接編輯 `~/.config/vpn-split/hosts.txt`，一行一項，可加註解。清單不支援萬用字元，網域不會自動包含子網域。
