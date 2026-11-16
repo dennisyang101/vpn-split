@@ -13,6 +13,8 @@ macOS 選單列與 CLI 工具。讓指定網域、IPv4 或網段走 VPN，其餘
 
 CLI 位於 `~/.local/bin/vpn-split`，請將 `~/.local/bin` 加入 `PATH`。SwiftBar 沿用既有插件目錄，未設定時請選擇 `~/.config/swiftbar`。重複安裝即為更新，保留 `~/.config/vpn-split/` 的設定。
 
+若要重開機後自動顯示選單列，請在 macOS「系統設定 → 一般 → 登入項目與延伸功能」的「登入時開啟」加入 SwiftBar。完成後重新啟動 Mac 並登入，vpn-split 選單才會出現在上方選單列。
+
 啟用分流前先連上 VPN，再用 `vpn-split routing-plan` 檢查支援狀態。遠端操作請保留獨立復原連線；安裝完成後用 `vpn-split doctor` 確認實際套用結果。
 
 ## 設定 VPN 控制
