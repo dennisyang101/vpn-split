@@ -19,7 +19,7 @@ for path in "$BIN" "$SELF" "$CONF_DIR"; do
 done
 [[ -x $BIN ]] || { printf 'VPN ? | sfimage=questionmark.circle\n---\n找不到 CLI\n'; exit 0; }
 if [[ ${1:-} == add ]]; then
-  input=$(/usr/bin/osascript -e 'text returned of (display dialog "要使用 VPN 的網域、網址或 IPv4：" default answer "" with title "vpn-split")' 2>/dev/null) || exit 0
+  input=$(/usr/bin/osascript -e 'text returned of (display dialog "分流模式下走 VPN 的網域、網址、IPv4 或網段：" default answer "" with title "vpn-split")' 2>/dev/null) || exit 0
   [[ -n $input ]] || exit 0
   message=$("$BIN" add "$input" 2>&1)
   /usr/bin/osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "vpn-split"' -e 'end run' "$message" >/dev/null 2>&1 || :
@@ -36,51 +36,77 @@ action() {
   printf '%s | bash=%s param1=%s terminal=true refresh=true\n' "$title" "$(quote "$BIN")" "$(quote "$command")"
 }
 connected=$(get connected); desired=$(get mode); applied=$(get applied_mode)
+provider=$(get provider); iface=$(get iface); daemon=$(get daemon)
 case $connected in
   yes) printf 'VPN | sfimage=arrow.triangle.branch\n';;
   no) printf 'IP | sfimage=network\n';;
   *) printf 'VPN ? | sfimage=questionmark.circle\n';;
 esac
 printf '%s\n' '---'
-mode_name() { case $1 in split) printf '分流';; full) printf '全隧道';; *) printf '無';; esac; }
-iface=$(get iface); daemon=$(get daemon)
-if [[ $connected == yes && $desired == "$applied" && $daemon == running ]]; then
-  printf '%s：已套用（VPN %s，背景服務運作中）\n' "$(mode_name "$desired")" "$iface"
+case $connected in
+  yes) printf 'VPN：已連線\n';;
+  no) printf 'VPN：未連線\n';;
+  *) printf 'VPN：狀態不明\n';;
+esac
+mode_name() {
+  case $1 in split) printf '僅清單目標走 VPN';; full) printf '全部走 VPN';; *) printf '未知模式';; esac
+}
+if [[ $connected == yes && $daemon == running && ( $applied == split || $applied == full ) ]]; then
+  printf '路由模式：%s' "$(mode_name "$applied")"
+  if [[ $desired != "$applied" ]]; then printf '（待切換）'; fi
+  printf '\n'
 else
-  case $connected in yes) printf 'VPN：已連線（%s）\n' "$iface";; no) printf 'VPN：未連線\n';; *) printf 'VPN：狀態不明\n';; esac
-  printf '模式：想要 %s，目前已套用 %s\n' "$(mode_name "$desired")" "$(mode_name "$applied")"
-  printf '背景服務：%s\n' "$([[ $daemon == running ]] && printf 運作中 || printf 未執行)"
+  printf '分流：未啟用\n'
 fi
-current=$(get current_ip); via=$(get current_iface); ms=$(get current_ms); vpn=$(get vpn_ip)
-printf '%s\n' '---' '出口 IP（對方看到的你）'
-if [[ -z $current ]]; then printf '目前路徑：取得失敗\n'
-elif [[ -n $iface && $via == "$iface" ]]; then printf '直連：未測得（測試流量走 VPN）\n'
-elif [[ $via =~ ^(en|bridge|bond|vlan)[0-9]+$ ]]; then printf '直連：%s（%s，延遲 %s ms）\n' "$current" "$via" "$ms"
-else printf '目前路徑：%s（%s，延遲 %s ms，未確認直連）\n' "$current" "${via:-未知}" "$ms"; fi
-if [[ -z $iface ]]; then printf 'VPN：未連線\n'
-elif [[ -z $vpn ]]; then printf 'VPN：未測得（清單加入 api.ipify.org 即可顯示）\n'
-else printf 'VPN：%s（%s）\n' "$vpn" "$iface"; fi
-printf '區網 IP：%s（%s）\n' "$(get lan_ip)" "$(get lan_if)"
+current=$(get current_ip); via=$(get current_iface); vpn=$(get vpn_ip)
+if [[ -z $current ]]; then
+  printf '目前出口 IP：取得失敗\n'
+elif [[ -n $iface && $via == "$iface" ]]; then
+  printf 'VPN 出口 IP：%s\n' "$current"
+elif [[ $via =~ ^(en|bridge|bond|vlan)[0-9]+$ ]]; then
+  printf '直連出口 IP：%s\n' "$current"
+else
+  printf '目前出口 IP：%s（路徑未確認）\n' "$current"
+fi
+if [[ -n $iface && ( -z $current || $via != "$iface" ) ]]; then
+  printf 'VPN 出口 IP：%s\n' "${vpn:-未測得}"
+fi
+printf '區網 IP：%s\n' "$(get lan_ip)"
 printf '%s\n' '---'
-if [[ $connected == yes ]]; then action '中斷 VPN' disconnect; else action '連線 VPN' connect; fi
+case $provider in
+  manual|'')
+    if [[ $connected == yes ]]; then label='手動模式，請至 VPN App 中斷'; else label='手動模式，請至 VPN App 連線'; fi
+    printf '%s | disabled=true\n' "$label";;
+  scutil|hooks)
+    if [[ $connected == yes ]]; then action '中斷 VPN' disconnect
+    elif [[ $connected == no ]]; then action '連線 VPN' connect; fi;;
+esac
 if [[ $desired == full ]]; then next='split'; else next='full'; fi
-printf '切換到%s | bash=%s param1=mode param2=%s terminal=false refresh=true\n' "$(mode_name "$next")" "$(quote "$BIN")" "$next"
-printf '%s\n' '---' '清單網站'
+printf '設定為%s | bash=%s param1=mode param2=%s terminal=false refresh=true\n' "$(mode_name "$next")" "$(quote "$BIN")" "$next"
+printf '%s\n' '---' '走 VPN 的網域與 IP'
+targets=0
 while IFS= read -r line; do
   [[ $line == domain=* ]] || continue
   read -r name path ip <<< "${line#domain=}"
   [[ $name =~ ^[a-z0-9./-]+$ ]] || continue
-  case $path in vpn) mark='✓'; how='走 VPN';; direct) mark='✗'; how='直連，未走 VPN';; *) mark='?'; how='路徑不明';; esac
+  targets=1
+  case $path in vpn) mark='✓'; how='目前走 VPN';; direct) mark='✗'; how='目前直連';; *) mark='?'; how='路徑不明';; esac
   printf '%s %s\n' "$mark" "$name"
   printf -- '--%s | disabled=true\n' "$how"
   printf -- '--伺服器 IP：%s | disabled=true\n' "$ip"
   printf -- '--從清單移除 | bash=%s param1=remove param2=%s terminal=false refresh=true\n' "$(quote "$BIN")" "$(quote "$name")"
 done <<< "$info"
-printf '加入網域… | bash=%s param1=add terminal=false refresh=true\n' "$(quote "$SELF")"
+[[ $targets == 1 ]] || printf '尚未新增網域或 IP | disabled=true\n'
+printf '新增網域或 IP… | bash=%s param1=add terminal=false refresh=true\n' "$(quote "$SELF")"
 printf '編輯清單 | bash=/usr/bin/open param1=-t param2=%s terminal=false\n' "$(quote "$CONF_DIR/hosts.txt")"
-printf '%s\n' '---'
-action '完整狀態' status
-action 'HTTPS 健康檢查' health
-action '測速（下載 10 MB）' speedtest
-action '設定與路由檢查' doctor
+printf '%s\n' '---' '診斷'
+action '--查看連線與分流狀態' status
+action '--測試清單目標的 HTTPS 連線' health
+printf -- '--直連測速（10 MB） | bash=%s param1=speedtest param2=direct terminal=true refresh=true\n' "$(quote "$BIN")"
+if [[ $connected == yes && $iface =~ ^utun[0-9]+$ ]]; then
+  printf -- '--VPN 測速（10 MB） | bash=%s param1=speedtest param2=vpn terminal=true refresh=true\n' "$(quote "$BIN")"
+else
+  printf '%s\n' '--VPN 測速（10 MB） | disabled=true'
+fi
+action '--檢查設定與路由' doctor
 printf '重新整理 | refresh=true\n'

@@ -444,6 +444,7 @@ cmd_info() {
   read -r public remote via ms <<< "$(probe)" || :
   if [[ -n $iface && $via == "$iface" ]]; then vpn_ip=$public; else vpn_ip=$(vpn_probe "$iface") || :; fi
   lan=$(route_iface default)
+  printf 'provider=%s\n' "$(config_get kind)"
   printf 'connected=%s\niface=%s\nmode=%s\napplied_mode=%s\ndaemon=%s\n' "$(connected_state)" "$iface" "$(mode)" "$(state_get applied | awk 'NF{print; found=1} END{if(!found)print "none"}')" "$(daemon_running && printf running || printf stopped)"
   printf 'lan_if=%s\nlan_ip=%s\ncurrent_ip=%s\ncurrent_iface=%s\ncurrent_ms=%s\nvpn_ip=%s\n' "$lan" "$(ipconfig getifaddr "$lan" 2>/dev/null || :)" "$public" "$via" "$ms" "$vpn_ip"
   while IFS= read -r host; do
@@ -510,13 +511,42 @@ cmd_health() {
   while IFS= read -r host; do check_host "$host" || failed=1; done < <(entries)
   return "$failed"
 }
+speedtest_iface() {
+  local kind route iface
+  kind=$1
+  if [[ $kind == vpn ]]; then
+    route=$(tunnel) || { fail 'VPN 測速需要有效的連線中 utun 隧道'; return 1; }
+    read -r _ iface <<< "$route"
+  else
+    route=$(exact_route 0.0.0.0/0) || return 1
+    [[ -n $route && $route != *$'\n'* ]] || { fail "無法確認唯一的直連預設路由 [$route]"; return 1; }
+    read -r _ iface <<< "$route"
+    [[ $iface =~ ^(en|bridge|bond|vlan)[0-9]+$ ]] || { fail '直連介面不受支援或預設路由不明'; return 1; }
+  fi
+  printf '%s\n' "$iface"
+}
+speedtest_transfer() {
+  local kind=$1 iface=$2 out bytes seconds remote code local_ip addr route selected
+  out=$(env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY curl -q -4 --noproxy '*' --interface "if!$iface" --connect-timeout 5 --max-time 20 -fsS -o /dev/null -w '%{size_download} %{time_total} %{remote_ip} %{http_code} %{local_ip}' "https://$SPEED_HOST/__down?bytes=10000000" 2>/dev/null) || { fail '測速失敗，無可用結果'; return 1; }
+  read -r bytes seconds remote code local_ip <<< "$out"
+  if [[ $bytes != 10000000 || ! $seconds =~ ^[0-9]+([.][0-9]+)?$ || $code != 200 ]] || ! valid_ip "$remote" || ! valid_ip "$local_ip" || ! awk -v s="$seconds" 'BEGIN{exit !(s>0)}'; then
+    fail '測速回應資料無效或下載未完成'; return 1
+  fi
+  addr=$(ifconfig "$iface" 2>/dev/null | awk '$1=="inet" {print $2}') || { fail '無法讀取測速介面'; return 1; }
+  grep -qxF "$local_ip" <<< "$addr" || { fail '測速來源 IP 與指定介面不符'; return 1; }
+  route=$(route -n get -ifscope "$iface" "$remote" 2>/dev/null | awk '/interface:/{print $2; exit}') || { fail '無法查詢測速路由'; return 1; }
+  [[ $route == "$iface" ]] || { fail '無法確認下載連線使用指定介面'; return 1; }
+  selected=$(speedtest_iface "$kind") || return 1
+  [[ $selected == "$iface" ]] || { fail '測速期間網路介面狀態已變更'; return 1; }
+  awk -v b="$bytes" -v s="$seconds" -v i="$iface" -v k="$kind" 'BEGIN{printf "%s 測速：介面 %s，下載 %d bytes，耗時 %.3f s，平均 %.1f Mbps\n",(k=="vpn"?"VPN":"直連"),i,b,s,b*8/s/1000000}'
+}
 cmd_speedtest() {
-  local out bytes seconds remote iface code
-  out=$(curl -4 -fsS --max-time 20 -o /dev/null -w '%{size_download} %{time_total} %{remote_ip} %{http_code}' "https://$SPEED_HOST/__down?bytes=10000000" 2>/dev/null) || { fail '測速失敗，無可用結果'; return 1; }
-  read -r bytes seconds remote code <<< "$out"
-  [[ $bytes =~ ^[0-9]+$ && $seconds =~ ^[0-9]+([.][0-9]+)?$ && $code == 200 ]] && valid_ip "$remote" || return 1
-  iface=$(route_iface "$remote")
-  awk -v b="$bytes" -v s="$seconds" -v i="${iface:-unknown}" 'BEGIN{if(b!=10000000 || s<=0)exit 1; printf "目前路徑 %.1f Mbps，介面 %s，下載 %d bytes，耗時 %.3f s\n",b*8/s/1000000,i,b,s}'
+  local kind iface
+  [[ $# -le 1 ]] || { fail 'speedtest [direct|vpn]'; return 2; }
+  kind=${1:-direct}
+  [[ $kind == direct || $kind == vpn ]] || { fail 'speedtest [direct|vpn]'; return 2; }
+  iface=$(speedtest_iface "$kind") || return 1
+  speedtest_transfer "$kind" "$iface"
 }
 # bootout returns before launchd finishes teardown; bootstrapping the same label meanwhile fails with EIO.
 wait_service_unloaded() {
@@ -586,7 +616,7 @@ cmd_uninstall_routing() {
   sudo rm -f "$PLIST" "$ROOT_BIN"
 }
 usage() {
-  printf '%s\n' 'vpn-split status | info | doctor' 'vpn-split add|remove <domain|URL|IPv4|CIDR> ... | list' 'vpn-split config [manual|scutil SERVICE|hooks START_PATH STOP_PATH]' 'vpn-split connect | disconnect | mode [split|full]' 'vpn-split check DOMAIN | health | speedtest | routing-plan' 'vpn-split install-routing | uninstall-routing' '一般使用者安裝／移除請執行 repo 的 install.command / uninstall.command。'
+  printf '%s\n' 'vpn-split status | info | doctor' 'vpn-split add|remove <domain|URL|IPv4|CIDR> ... | list' 'vpn-split config [manual|scutil SERVICE|hooks START_PATH STOP_PATH]' 'vpn-split connect | disconnect | mode [split|full]' 'vpn-split check DOMAIN | health | speedtest [direct|vpn] | routing-plan' 'vpn-split install-routing | uninstall-routing' '一般使用者安裝／移除請執行 repo 的 install.command / uninstall.command。'
 }
 main() {
   local value
@@ -596,7 +626,7 @@ main() {
     add|remove|rm) value=$1; [[ $value != rm ]] || value=remove; shift; cmd_edit "$value" "$@";;
     config) shift; cmd_config "$@";; connect) provider_action start;; disconnect) provider_action stop;;
     mode) shift; if (($# == 0)); then mode; elif [[ $# == 1 && ( $1 == split || $1 == full ) ]]; then mkdir -p "$CONF_DIR" && printf '%s\n' "$1" > "$MODE_FILE"; else fail 'mode [split|full]'; fi;;
-    check) [[ $# == 2 ]] || return 1; check_host "$2";; health) cmd_health;; speedtest) cmd_speedtest;;
+    check) [[ $# == 2 ]] || return 1; check_host "$2";; health) cmd_health;; speedtest) shift; cmd_speedtest "$@";;
     routing-plan) cmd_routing_plan;; daemon) cmd_daemon;;
     restore)
       ((EUID == 0)) && secure_run_dir || return 1

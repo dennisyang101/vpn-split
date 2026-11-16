@@ -91,8 +91,8 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("VPN：未連線", result.stdout)
-        self.assertIn("目前路徑：取得失敗", result.stdout)
-        for label in ("連線 VPN", "加入網域", "編輯清單", "測速", "HTTPS 健康檢查", "192.0.2.0/24"):
+        self.assertIn("目前出口 IP：取得失敗", result.stdout)
+        for label in ("手動模式，請至 VPN App 連線", "新增網域或 IP", "編輯清單", "直連測速（10 MB）", "測試清單目標的 HTTPS 連線", "192.0.2.0/24"):
             self.assertIn(label, result.stdout)
         edit = next(line for line in result.stdout.splitlines() if line.startswith("編輯清單"))
         attrs = dict(token.split("=", 1) for token in shlex.split(edit.split("|", 1)[1]))
@@ -101,6 +101,196 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         attrs = dict(token.split("=", 1) for token in shlex.split(remove.split("|", 1)[1]))
         self.assertEqual(attrs["bash"], str(CLI))
         self.assertIn(attrs["param2"], ("example.org", "192.0.2.0/24"))
+
+    def menu(self, targets="", **fields):
+        info = dict(connected="no", iface="", mode="split", applied_mode="none", daemon="stopped",
+                    provider="manual", lan_ip="192.0.2.44", current_ip="203.0.113.7", current_iface="en0")
+        info.update(fields)
+        text = "".join(f"{k}={v}\n" for k, v in info.items()) + targets
+        fake = self.script("menu cli", "printf '%s' " + shlex.quote(text))
+        env = dict(self.env, VPN_SPLIT_BIN=str(fake))
+        result = subprocess.run([str(ROOT / "vpn-split.1m.sh")], env=env,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_menu_disconnected_is_concise_and_manual_is_not_an_action(self):
+        out = self.menu()
+        self.assertEqual(out.count("VPN：未連線"), 1)
+        self.assertIn("分流：未啟用\n", out)
+        self.assertIn("直連出口 IP：203.0.113.7\n", out)
+        self.assertIn("尚未新增網域或 IP | disabled=true", out)
+        self.assertIn("手動模式，請至 VPN App 連線 | disabled=true", out)
+        for unwanted in ('param1="connect"', 'param1="disconnect"', "背景服務", "想要", "對方看到", "VPN 出口 IP"):
+            self.assertNotIn(unwanted, out)
+        self.assertIn("目前出口 IP：取得失敗", self.menu(current_ip=""))
+        self.assertIn("（路徑未確認）", self.menu(current_iface="utun99"))
+
+    def test_menu_modes_use_actual_applied_state(self):
+        base = dict(connected="yes", iface="utun7", daemon="running", vpn_ip="198.51.100.99")
+        for mode, label, next_mode in (("split", "僅清單目標走 VPN", "full"), ("full", "全部走 VPN", "split")):
+            with self.subTest(mode=mode):
+                out = self.menu(**base, mode=mode, applied_mode=mode)
+                self.assertIn(f"路由模式：{label}\n", out)
+                self.assertIn(f"param2={next_mode}", out)
+                self.assertIn("手動模式，請至 VPN App 中斷 | disabled=true", out)
+                self.assertNotIn('param1="disconnect"', out)
+        out = self.menu(**base, mode="full", applied_mode="split")
+        self.assertIn("路由模式：僅清單目標走 VPN（待切換）", out)
+        self.assertIn("分流：未啟用", self.menu(**base, applied_mode="none"))
+        self.assertIn("分流：未啟用", self.menu(connected="yes", applied_mode="split", daemon="stopped"))
+        out = self.menu(**base, current_iface="utun7", current_ip="198.51.100.99")
+        self.assertEqual(out.count("VPN 出口 IP：198.51.100.99"), 1)
+        self.assertNotIn("直連出口 IP", out)
+        self.assertIn("VPN 出口 IP：未測得", self.menu(connected="yes", iface="utun7"))
+
+    def test_menu_configured_providers_keep_connection_actions(self):
+        for provider in ("scutil", "hooks"):
+            for connected, command in (("yes", "disconnect"), ("no", "connect")):
+                with self.subTest(provider=provider, connected=connected):
+                    out = self.menu(provider=provider, connected=connected)
+                    line = next(line for line in out.splitlines() if f'param1="{command}"' in line)
+                    attrs = dict(token.split("=", 1) for token in shlex.split(line.split("|", 1)[1]))
+                    self.assertEqual(attrs["param1"], command)
+                    self.assertEqual(attrs["terminal"], "true")
+
+    def test_menu_diagnostics_are_submenu_actions(self):
+        out = self.menu(targets="domain=example.org direct 192.0.2.80\n")
+        lines = out.splitlines()
+        index = lines.index("診斷")
+        expected = (("status", ""), ("health", ""), ("speedtest", "direct"), ("speedtest", "vpn"), ("doctor", ""))
+        for line, (command, mode) in zip(lines[index + 1:index + 6], expected):
+            self.assertTrue(line.startswith("--"), line)
+            attrs = dict(token.split("=", 1) for token in shlex.split(line.split("|", 1)[1]))
+            if mode == "vpn":
+                self.assertEqual(line, "--VPN 測速（10 MB） | disabled=true")
+                continue
+            self.assertEqual(attrs["param1"], command)
+            if mode:
+                self.assertEqual(attrs["param2"], mode)
+            self.assertEqual(attrs["terminal"], "true")
+        self.assertEqual(lines[index + 6], "重新整理 | refresh=true")
+        self.assertIn("走 VPN 的網域與 IP", out)
+        self.assertIn("✗ example.org\n--目前直連", out)
+        self.assertNotIn("尚未新增網域或 IP", out)
+
+    def test_menu_enables_vpn_speedtest_only_for_live_tunnel(self):
+        out = self.menu(connected="yes", iface="utun7")
+        line = next(line for line in out.splitlines() if line.startswith("--VPN 測速"))
+        self.assertIn("param1=speedtest param2=vpn", line)
+
+    def test_info_reports_provider_for_menu(self):
+        self.assertIn("provider=manual\n", self.run_cli("info").stdout)
+        self.run_cli("config", "scutil", "Test VPN")
+        self.assertIn("provider=scutil\n", self.run_cli("info").stdout)
+        start = self.script("start hook", "exit 0")
+        stop = self.script("stop hook", "exit 0")
+        self.run_cli("config", "hooks", str(start), str(stop))
+        self.assertIn("provider=hooks\n", self.run_cli("info").stdout)
+
+    def speed_fixtures(self):
+        self.env.update(SPEED_OUTPUT="10000000 2.000 198.51.100.8 200 192.0.2.44",
+                        SPEED_CURL_EXIT="0", SPEED_ROUTE_IFACE="en0", SPEED_ROUTE_EXIT="0",
+                        SPEED_IFCONFIG_EXIT="0", SPEED_DEFAULT="en0", SPEED_CHANGE="no",
+                        SPEED_MARK=str(self.base / "speed-done"))
+        self.script("netstat", '''printf 'Routing tables\nInternet:\nDestination Gateway Flags Netif Expire\n'
+if [ "$SPEED_CHANGE" = yes ] && [ -f "$SPEED_MARK" ]; then exit 0; fi
+case "$SPEED_DEFAULT" in
+ none) ;;
+ multiple) printf 'default 192.0.2.1 UGSc en0\ndefault 192.0.2.2 UGSc en1\n';;
+ *) printf 'default 192.0.2.1 UGSc %s\n' "$SPEED_DEFAULT";;
+esac
+if [ "$VPN_MODE" = supported ]; then printf '0/1 10.8.0.1 UGSc utun7\n128.0/1 10.8.0.1 UGSc utun7\n'; fi''')
+        self.script("ifconfig", '''if [ "$1" = en0 ]; then
+ printf 'en0: flags=8863<UP>\n    inet 192.0.2.44 netmask 0xffffff00\n    inet 192.0.2.45 netmask 0xffffff00\n'
+else
+ printf 'utun7: flags=8051<UP,POINTOPOINT,RUNNING>\n    inet 10.8.0.2 --> 10.8.0.1 netmask 0xffffffff\n'
+fi
+exit "$SPEED_IFCONFIG_EXIT"''')
+        self.script("curl", '''printf 'curl\n' >> "$CALL_LOG"
+printf '%s\n' "$@" > "$SPEED_MARK"
+for key in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
+ eval 'value=${'"$key"'-}'
+ [ -z "$value" ] || exit 91
+done
+printf '%s' "$SPEED_OUTPUT"
+exit "$SPEED_CURL_EXIT"''')
+        self.script("route", '''[ "$1 $2 $3" = '-n get -ifscope' ] || exit 99
+printf 'scope:%s:%s\n' "$4" "$5" >> "$CALL_LOG"
+printf 'interface: %s\n' "$SPEED_ROUTE_IFACE"
+exit "$SPEED_ROUTE_EXIT"''')
+
+    def test_speedtest_binds_each_path_and_checks_full_download(self):
+        self.speed_fixtures()
+        for kind, iface, local, label in (("direct", "en0", "192.0.2.44", "直連"),
+                                           ("vpn", "utun7", "10.8.0.2", "VPN")):
+            with self.subTest(kind=kind):
+                self.env.update(VPN_MODE="supported", SPEED_ROUTE_IFACE=iface,
+                                SPEED_OUTPUT=f"10000000 2.000 198.51.100.8 200 {local}")
+                out = self.run_cli("speedtest", kind).stdout
+                self.assertEqual(out, f"{label} 測速：介面 {iface}，下載 10000000 bytes，耗時 2.000 s，平均 40.0 Mbps\n")
+                args = (self.base / "speed-done").read_text().splitlines()
+                self.assertEqual(args[0], "-q")
+                self.assertEqual(args[args.index("--interface") + 1], "if!" + iface)
+                self.assertEqual(args[args.index("--noproxy") + 1], "*")
+                self.assertIn("https://speed.cloudflare.com/__down?bytes=10000000", args)
+                self.assertIn(f"scope:{iface}:198.51.100.8", (self.base / "calls").read_text())
+        self.assertNotIn("sudo", (self.base / "calls").read_text())
+        self.assertNotIn("launchctl", (self.base / "calls").read_text())
+        self.assertFalse(self.conf.joinpath("hosts.txt").exists())
+        self.assertFalse(self.conf.joinpath("mode").exists())
+
+    def test_speedtest_rejects_unavailable_paths_before_downloading(self):
+        self.speed_fixtures()
+        for args, default in ((("vpn",), "en0"), (("direct",), "none"),
+                              (("direct",), "multiple"), (("direct",), "utun99"),
+                              (("unknown",), "en0"), (("direct", "extra"), "en0")):
+            with self.subTest(args=args, default=default):
+                self.env["SPEED_DEFAULT"] = default
+                result = self.run_cli("speedtest", *args, ok=False)
+                self.assertNotIn("Mbps", result.stdout)
+                self.assertFalse((self.base / "speed-done").exists())
+
+    def test_speedtest_rejects_invalid_transfers_without_fallback(self):
+        self.speed_fixtures()
+        for output, exit_code in (("10000000 2 198.51.100.8 503 192.0.2.44", "0"),
+                                  ("999 2 198.51.100.8 200 192.0.2.44", "0"),
+                                  ("10000000 0 198.51.100.8 200 192.0.2.44", "0"),
+                                  ("10000000 bad 198.51.100.8 200 192.0.2.44", "0"),
+                                  ("10000000 2 invalid 200 192.0.2.44", "0"),
+                                  ("10000000 2 198.51.100.8 200 invalid", "0"),
+                                  ("", "7")):
+            with self.subTest(output=output, exit_code=exit_code):
+                self.env.update(SPEED_OUTPUT=output, SPEED_CURL_EXIT=exit_code)
+                result = self.run_cli("speedtest", "direct", ok=False)
+                self.assertNotIn("Mbps", result.stdout)
+        self.assertEqual((self.base / "calls").read_text().splitlines(), ["curl"] * 7)
+
+    def test_speedtest_rejects_unverified_or_changed_interface(self):
+        self.speed_fixtures()
+        cases = ({"SPEED_OUTPUT": "10000000 2 198.51.100.8 200 10.8.0.2"},
+                 {"SPEED_ROUTE_IFACE": "utun99"}, {"SPEED_ROUTE_IFACE": ""},
+                 {"SPEED_ROUTE_EXIT": "1"}, {"SPEED_IFCONFIG_EXIT": "1"},
+                 {"SPEED_CHANGE": "yes"})
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.env.update(SPEED_OUTPUT="10000000 2 198.51.100.8 200 192.0.2.44",
+                                SPEED_ROUTE_IFACE="en0", SPEED_ROUTE_EXIT="0",
+                                SPEED_IFCONFIG_EXIT="0", SPEED_CHANGE="no")
+                self.env.update(overrides)
+                (self.base / "speed-done").unlink(missing_ok=True)
+                result = self.run_cli("speedtest", "direct", ok=False)
+                self.assertNotIn("Mbps", result.stdout)
+        self.env.update(SPEED_CHANGE="yes", VPN_MODE="supported",
+                        SPEED_OUTPUT="10000000 2 198.51.100.8 200 10.8.0.2", SPEED_ROUTE_IFACE="utun7")
+        (self.base / "speed-done").unlink()
+        self.run_cli("speedtest", "vpn", ok=False)
+
+    def test_speedtest_suppresses_proxy_environment(self):
+        self.speed_fixtures()
+        for key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            self.env[key] = "http://127.0.0.1:9"
+        self.assertIn("直連 測速", self.run_cli("speedtest").stdout)
 
     def test_current_probe_is_not_falsely_labeled_vpn(self):
         self.env["CURL_MODE"] = "probe"

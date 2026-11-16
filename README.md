@@ -40,8 +40,11 @@ vpn-split mode full        # 恢復 VPN 原本的全隧道路由
 vpn-split status           # 出口 IP、延遲與各網站路徑
 vpn-split check example.org
 vpn-split health
-vpn-split speedtest        # 下載 10 MB，測量目前路徑
+vpn-split speedtest direct # 直連介面下載 10 MB
+vpn-split speedtest vpn    # VPN utun 介面下載 10 MB（須有有效連線）
 ```
+
+兩種測速各自固定下載 10 MB，計算單次下載的平均速度，不代表線路峰值。測速會明確綁定選定介面；直連測速只接受唯一、可確認的非 VPN 預設介面，VPN 測速只接受有效的 utun 隧道，驗證失敗不會改走其他路徑。curl proxy 環境變數與 `.curlrc` 不會套用；DNS 仍使用系統解析器，因此這不是 DNS 綁定或防洩漏功能。測速不修改路由或 VPN 設定。
 
 也可從選單列操作，或直接編輯 `~/.config/vpn-split/hosts.txt`，一行一項，可加註解。清單不支援萬用字元，網域不會自動包含子網域。
 

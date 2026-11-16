@@ -22,8 +22,8 @@ cat >"$MOCKBIN/curl" <<'MOCK'
 case "${CURL_MODE:-fail}" in
  probe) printf 'ip=203.0.113.7\n\nVS_REMOTE 198.51.100.8 0.025\n';;
  http) printf '198.51.100.9 503 0.125';;
- speed) printf '10000000 2.000 198.51.100.8 200';;
- truncated) printf '1234 0.500 198.51.100.8 200';;
+ speed) printf '10000000 2.000 198.51.100.8 200 192.0.2.44';;
+ truncated) printf '1234 0.500 198.51.100.8 200 192.0.2.44';;
  *) exit 7;;
 esac
 MOCK
@@ -42,11 +42,11 @@ exit 1
 MOCK
 cat >"$MOCKBIN/netstat" <<'MOCK'
 #!/bin/sh
-exit 0
+printf 'Routing tables\nInternet:\nDestination Gateway Flags Netif Expire\n0.0.0.0/0 192.0.2.1 UGSc en0\n'
 MOCK
 cat >"$MOCKBIN/ifconfig" <<'MOCK'
 #!/bin/sh
-printf 'utun7: flags=8051<UP,POINTOPOINT,RUNNING>\n'
+if [ "$1" = en0 ]; then printf 'en0: flags=8863<UP>\n    inet 192.0.2.44 netmask 0xffffff00\n'; else printf 'utun7: flags=8051<UP,POINTOPOINT,RUNNING>\n    inet 10.8.0.2 --> 10.8.0.1 netmask 0xffffffff\n'; fi
 MOCK
 cat >"$MOCKBIN/ipconfig" <<'MOCK'
 #!/bin/sh
@@ -142,7 +142,8 @@ CURL_MODE=http; export CURL_MODE
 if check_host example.org >/dev/null 2>&1; then check 0 'health check reports reachable HTTP error response'; else check 1 'health check reports reachable HTTP error response'; fi
 CURL_MODE=fail; export CURL_MODE
 if ! check_host example.org >/dev/null 2>&1; then check 0 'health check reports transport failure'; else check 1 'health check reports transport failure'; fi
-CURL_MODE=speed; export CURL_MODE
+reset_routes
+CURL_MODE=speed ROUTE_IFACE=en0; export CURL_MODE ROUTE_IFACE
 if cmd_speedtest >/dev/null 2>&1; then check 0 'speed test accepts exact complete download'; else check 1 'speed test accepts exact complete download'; fi
 CURL_MODE=truncated; export CURL_MODE
 if ! cmd_speedtest >/dev/null 2>&1; then check 0 'speed test rejects truncated download'; else check 1 'speed test rejects truncated download'; fi
