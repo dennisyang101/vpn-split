@@ -44,7 +44,7 @@ vpn-split speedtest direct # 直連介面下載 10 MB
 vpn-split speedtest vpn    # VPN utun 介面下載 10 MB（須有有效連線）
 ```
 
-分流模式下執行 VPN 測速前，先將測速站加入清單：
+分流模式下執行 VPN 測速時，測速站 `speed.cloudflare.com` 已包含在新安裝的預設清單中。若使用舊版或自訂清單而缺少該項目，可手動加入：
 
 ```bash
 vpn-split add speed.cloudflare.com
@@ -56,7 +56,7 @@ vpn-split add speed.cloudflare.com
 
 也可從選單列操作，或直接編輯 `~/.config/vpn-split/hosts.txt`，一行一項，可加註解。清單不支援萬用字元，網域不會自動包含子網域。
 
-狀態會區分「出口 IP」與「網站伺服器 IP」。要在分流模式顯示 VPN 出口，可執行 `vpn-split add api.ipify.org`；只有確認該測試連線走 VPN 才採用結果。診斷會連線至 Cloudflare、選用的 ipify 與受測網站，不會上傳整份清單。
+新安裝的 `hosts.txt` 預設包含 `speed.cloudflare.com`（測速）與 `api.ipify.org`（VPN 出口 IP 診斷），可直接使用相關功能。重裝不會改動既有清單；若舊版或自訂清單缺少診斷網域，可手動加入 `vpn-split add api.ipify.org`。只有確認該測試連線走 VPN 才採用結果。診斷會連線至 Cloudflare、清單中的 ipify 與受測網站，不會上傳整份清單。
 
 ## 限制
 

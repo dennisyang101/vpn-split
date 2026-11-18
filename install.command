@@ -9,7 +9,7 @@ CONF_DIR=${VPN_SPLIT_CONF_DIR:-"$HOME/.config/vpn-split"}
 PLUGIN_DIR=$(defaults read com.ameba.SwiftBar PluginDirectory 2>/dev/null || :)
 [[ -n $PLUGIN_DIR ]] || PLUGIN_DIR="$HOME/.config/swiftbar"
 mkdir -p "$BIN_DIR" "$CONF_DIR" "$PLUGIN_DIR"
-[[ -f $CONF_DIR/hosts.txt ]] || printf '# example.com\n# example.org\n' > "$CONF_DIR/hosts.txt"
+[[ -f $CONF_DIR/hosts.txt ]] || printf 'speed.cloudflare.com\napi.ipify.org\n' > "$CONF_DIR/hosts.txt"
 [[ -f $CONF_DIR/mode ]] || printf 'split\n' > "$CONF_DIR/mode"
 install -m 755 "$ROOT/vpn-split" "$BIN_DIR/vpn-split"
 install -m 755 "$ROOT/vpn-split.1m.sh" "$PLUGIN_DIR/vpn-split.1m.sh"

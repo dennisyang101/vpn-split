@@ -472,6 +472,36 @@ echo $((n - 1)) > {shlex.quote(str(pending))}''')
         self.assertEqual(state.read_text(), journal)
         self.assertFalse((self.base / "calls").exists())
 
+    def test_installer_seeds_defaults_only_when_hosts_file_is_absent(self):
+        expected = b"speed.cloudflare.com\napi.ipify.org\n"
+        cases = {
+            "fresh": None,
+            "custom": b"custom.example\n# retained comment\n",
+            "comments": b"# intentionally empty\n# no defaults\n",
+            "empty": b"",
+        }
+        for name, initial in cases.items():
+            with self.subTest(name=name):
+                conf = self.base / name / "config"
+                conf.mkdir(parents=True)
+                hosts = conf / "hosts.txt"
+                if initial is not None:
+                    hosts.write_bytes(initial)
+                env = dict(self.env, VPN_SPLIT_CONF_DIR=str(conf),
+                           VPN_SPLIT_BIN_DIR=str(self.base / name / "bin"))
+                command = [str(ROOT / "install.command")]
+                result = subprocess.run(command, env=env, capture_output=True,
+                                        text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                seeded = hosts.read_bytes()
+                self.assertEqual(seeded, expected if initial is None else initial)
+                result = subprocess.run(command, env=env, capture_output=True,
+                                        text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(hosts.read_bytes(), seeded)
+        self.assertFalse((self.base / "calls").exists(),
+                         "installer invoked privilege or host networking")
+
     def test_sandbox_install_upgrade_uninstall(self):
         self.run_cli("add", "example.org")
         (self.conf / "mode").write_text("full\n")
