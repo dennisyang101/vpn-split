@@ -51,7 +51,7 @@ esac
 mode_name() {
   case $1 in split) printf '僅清單目標走 VPN';; full) printf '全部走 VPN';; *) printf '未知模式';; esac
 }
-if [[ $connected == yes && $daemon == running && ( $applied == split || $applied == full ) ]]; then
+if [[ $(get routing_supported) != no && $connected == yes && $daemon == running && ( $applied == split || $applied == full ) ]]; then
   printf '路由模式：%s' "$(mode_name "$applied")"
   if [[ $desired != "$applied" ]]; then printf '（待切換）'; fi
   printf '\n'
@@ -81,8 +81,13 @@ case $provider in
     if [[ $connected == yes ]]; then action '中斷 VPN' disconnect
     elif [[ $connected == no ]]; then action '連線 VPN' connect; fi;;
 esac
-if [[ $desired == full ]]; then next='split'; else next='full'; fi
-printf '設定為%s | bash=%s param1=mode param2=%s terminal=false refresh=true\n' "$(mode_name "$next")" "$(quote "$BIN")" "$next"
+if [[ $(get routing_supported) == no && -n $iface ]]; then
+  printf '路由由 VPN App 管理 | disabled=true\n'
+  printf 'vpn-split 僅提供狀態與診斷 | disabled=true\n'
+else
+  if [[ $desired == full ]]; then next='split'; else next='full'; fi
+  printf '設定為%s | bash=%s param1=mode param2=%s terminal=false refresh=true\n' "$(mode_name "$next")" "$(quote "$BIN")" "$next"
+fi
 printf '%s\n' '---' '走 VPN 的網域與 IP'
 targets=0
 while IFS= read -r line; do

@@ -60,7 +60,8 @@ vpn-split add speed.cloudflare.com
 
 ## 限制
 
-- 支援 IPv4 point-to-point `utun`，且 VPN 建立同一介面的兩條互補 `/1` 路由，並保有非 VPN 的 default 路由。不代表所有 VPN 客戶端都相容。
+- 路由管理只支援 IPv4 point-to-point `utun`，且 VPN 建立同一介面的兩條互補 `/1` 路由，並保有非 VPN 的 default 路由。不代表所有 VPN 客戶端都相容。
+- WARP 等其他路由形式可提供唯讀狀態與 VPN 測速：測速站的所有 IPv4 必須一致走同一個啟用且具有 IPv4 的 `utun`。不會只憑介面存在或 VPN App 顯示連線就判定。其路由仍由 VPN App 管理，不提供分流切換；若測速站未走隧道或路徑不一致，無法據此辨識 VPN。
 - 分流依 DNS 解析後的 IP 設定路由，共用 IP 的網站可能一起走 VPN，DNS 更新也可能影響既有連線。
 - 不管理 IPv6 或 DNS 設定，不是防洩漏工具。VPN 專用 DNS 若需經隧道存取，請將其 IPv4 加入清單。
 - 多 VPN 或其他路由工具可能造成衝突。修改前會記錄復原資訊；遇到衝突請先斷開 VPN，再移除分流服務，不要直接刪除 state。
