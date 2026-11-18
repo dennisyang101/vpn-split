@@ -357,6 +357,21 @@ exit "$WARP_ROUTE_EXIT"''')
  ipv6) printf '%s: flags=8051<UP,POINTOPOINT,RUNNING>\\n    inet6 fe80::1\\n' "$1";;
  *) printf '%s: flags=8051<UP,POINTOPOINT,RUNNING>\\n    inet 192.0.2.22 --> 192.0.2.1\\n' "$1";; esac''')
 
+    def test_info_uses_consistent_warp_state_when_route_changes(self):
+        self.observed_warp_fixtures()
+        self.env["ROUTE_CHANGED"] = str(self.base / "route-changed")
+        self.script("route", '''[ "$1 $2" = '-n get' ] || exit 99
+if [ "$3" = "$WARP_DNS" ] && [ ! -e "$ROUTE_CHANGED" ]; then
+    printf 'interface: utun12\\n'
+    : > "$ROUTE_CHANGED"
+else
+    printf 'interface: en0\\n'
+fi''')
+        info = self.run_cli("info").stdout.splitlines()
+        self.assertIn("routing_supported=no", info)
+        self.assertIn("iface=utun12", info)
+        self.assertIn("connected=yes", info)
+
     def test_observed_warp_is_diagnostic_only_and_vpn_speedtest_binds_utun(self):
         self.observed_warp_fixtures()
         self.run_cli("add", "speed.cloudflare.com")
