@@ -103,7 +103,7 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         self.assertIn(attrs["param2"], ("example.org", "192.0.2.0/24"))
 
     def menu(self, targets="", **fields):
-        info = dict(connected="no", iface="", mode="split", applied_mode="none", daemon="stopped",
+        info = dict(connected="no", iface="", routing_kind="unverified", mode="split", applied_mode="none", daemon="stopped",
                     provider="manual", lan_ip="192.0.2.44", current_ip="203.0.113.7", current_iface="en0")
         info.update(fields)
         text = "".join(f"{k}={v}\n" for k, v in info.items()) + targets
@@ -127,7 +127,7 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         self.assertIn("（路徑未確認）", self.menu(current_iface="utun99"))
 
     def test_menu_modes_use_actual_applied_state(self):
-        base = dict(connected="yes", iface="utun7", daemon="running", vpn_ip="198.51.100.99")
+        base = dict(connected="yes", iface="utun7", routing_kind="managed", daemon="running", vpn_ip="198.51.100.99")
         for mode, label, next_mode in (("split", "僅清單目標走 VPN", "full"), ("full", "全部走 VPN", "split")):
             with self.subTest(mode=mode):
                 out = self.menu(**base, mode=mode, applied_mode=mode)
@@ -181,8 +181,8 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
 
     def test_menu_keeps_normal_and_disconnected_controls_enabled(self):
         for state in (
-            dict(connected="yes", iface="utun7", routing_supported="yes"),
-            dict(connected="no", iface="", routing_supported="no"),
+            dict(connected="yes", iface="utun7", routing_kind="managed"),
+            dict(connected="no", iface="", routing_kind="unverified"),
         ):
             with self.subTest(state=state):
                 out = self.menu(targets="domain=example.org direct 192.0.2.80\n", **state)
@@ -196,7 +196,7 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
 
     def test_external_menu_disables_actions_without_command_payloads(self):
         out = self.menu(targets="domain=example.org vpn 192.0.2.80\n", connected="yes",
-                        iface="utun12", routing_supported="no", daemon="running", applied_mode="split")
+                        iface="utun12", routing_kind="external", daemon="running", applied_mode="split")
         self.assertNotIn("路由模式：", out)
         for prefix in ("路由由 VPN App 管理，", "新增網域或 IP…", "編輯清單", "--無法移除", "--直連測速"):
             line = next(row for row in out.splitlines() if row.startswith(prefix))
@@ -205,6 +205,11 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         self.assertIn("--目前走 VPN", out)
         self.assertIn("--伺服器 IP：192.0.2.80", out)
         self.assertIn("param1=speedtest param2=vpn", out)
+
+    def test_menu_requires_cli_with_routing_classification(self):
+        out = self.menu(connected="yes", iface="utun12", routing_kind="", routing_supported="no")
+        self.assertIn("請一併更新 CLI 與選單", out)
+        self.assertNotIn("bash=", out)
 
     def test_info_reports_provider_for_menu(self):
         self.assertIn("provider=manual\n", self.run_cli("info").stdout)
@@ -393,8 +398,11 @@ else iface=$WARP_ROUTE_IFACE; exitcode=$WARP_ROUTE_EXIT; fi
 printf 'interface: %s\\n' "$iface"
 exit "$exitcode"''')
         info = self.run_cli("info").stdout
-        for field in ("routing_supported=no", "connected=yes", "iface=utun12"):
+        for field in ("routing_kind=external", "routing_supported=no", "connected=yes", "iface=utun12"):
             self.assertIn(field + "\n", info)
+        status = self.run_cli("status").stdout
+        self.assertIn("路由由 VPN App 管理", status)
+        self.assertNotIn("已套用（VPN", status)
         self.env["VPN_SPLIT_BIN"] = str(CLI)
         menu = subprocess.run([str(ROOT / "vpn-split.1m.sh")], env=self.env,
                               capture_output=True, text=True, timeout=15)
@@ -437,6 +445,7 @@ exit "$exitcode"''')
             with self.subTest(overrides=overrides):
                 self.observed_warp_fixtures(**overrides)
                 info = self.run_cli("info").stdout
+                self.assertIn("routing_kind=unverified\n", info)
                 self.assertIn("routing_supported=no\n", info)
                 self.assertIn("connected=no\n", info)
                 self.assertIn("iface=\n", info)
@@ -450,6 +459,7 @@ exit "$exitcode"''')
             with self.subTest(route_shape=route_shape):
                 self.env["VPN_MODE"] = route_shape
                 info = self.run_cli("info").stdout
+                self.assertIn("routing_kind=unverified\n", info)
                 self.assertIn("routing_supported=no\n", info)
                 self.assertIn("connected=no\n", info)
                 self.assertIn("iface=\n", info)
@@ -458,6 +468,7 @@ exit "$exitcode"''')
     def test_legacy_managed_tunnel_still_advertises_routing_support(self):
         self.env["VPN_MODE"] = "supported"
         info = self.run_cli("info").stdout
+        self.assertIn("routing_kind=managed\n", info)
         self.assertIn("routing_supported=yes\n", info)
         self.assertIn("iface=utun7\n", info)
 
@@ -476,7 +487,7 @@ if [ "$3" = 192.0.2.80 ]; then printf 'interface: %s\\n' "$ECHO_IFACE"; else pri
         self.assertIn("vpn_ip=\n", self.run_cli("info").stdout)
 
     def render(self, **fields):
-        info = dict(connected="yes", iface="utun4", mode="split", applied_mode="split", daemon="running",
+        info = dict(connected="yes", iface="utun4", routing_kind="managed", mode="split", applied_mode="split", daemon="running",
                     lan_if="en0", lan_ip="192.0.2.44", current_ip="203.0.113.7", current_iface="en0",
                     current_ms="13", vpn_ip="198.51.100.99")
         info.update(fields)
