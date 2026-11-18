@@ -37,6 +37,8 @@ action() {
 }
 connected=$(get connected); desired=$(get mode); applied=$(get applied_mode)
 provider=$(get provider); iface=$(get iface); daemon=$(get daemon)
+external_managed=no
+if [[ $(get routing_supported) == no && -n $iface ]]; then external_managed=yes; fi
 case $connected in
   yes) printf 'VPN | sfimage=arrow.triangle.branch\n';;
   no) printf 'IP | sfimage=network\n';;
@@ -51,7 +53,9 @@ esac
 mode_name() {
   case $1 in split) printf '僅清單目標走 VPN';; full) printf '全部走 VPN';; *) printf '未知模式';; esac
 }
-if [[ $(get routing_supported) != no && $connected == yes && $daemon == running && ( $applied == split || $applied == full ) ]]; then
+if [[ $external_managed == yes ]]; then
+  printf '路由由 VPN App 管理（vpn-split 僅提供狀態與診斷）\n'
+elif [[ $connected == yes && $daemon == running && ( $applied == split || $applied == full ) ]]; then
   printf '路由模式：%s' "$(mode_name "$applied")"
   if [[ $desired != "$applied" ]]; then printf '（待切換）'; fi
   printf '\n'
@@ -81,14 +85,14 @@ case $provider in
     if [[ $connected == yes ]]; then action '中斷 VPN' disconnect
     elif [[ $connected == no ]]; then action '連線 VPN' connect; fi;;
 esac
-if [[ $(get routing_supported) == no && -n $iface ]]; then
-  printf '路由由 VPN App 管理 | disabled=true\n'
-  printf 'vpn-split 僅提供狀態與診斷 | disabled=true\n'
+if [[ $external_managed == yes ]]; then
+  printf '路由由 VPN App 管理，無法切換路由模式 | disabled=true\n'
 else
   if [[ $desired == full ]]; then next='split'; else next='full'; fi
   printf '設定為%s | bash=%s param1=mode param2=%s terminal=false refresh=true\n' "$(mode_name "$next")" "$(quote "$BIN")" "$next"
 fi
 printf '%s\n' '---' '走 VPN 的網域與 IP'
+if [[ $external_managed == yes ]]; then printf '清單目前唯讀（路由由 VPN App 管理） | disabled=true\n'; fi
 targets=0
 while IFS= read -r line; do
   [[ $line == domain=* ]] || continue
@@ -99,15 +103,21 @@ while IFS= read -r line; do
   printf '%s %s\n' "$mark" "$name"
   printf -- '--%s | disabled=true\n' "$how"
   printf -- '--伺服器 IP：%s | disabled=true\n' "$ip"
-  printf -- '--從清單移除 | bash=%s param1=remove param2=%s terminal=false refresh=true\n' "$(quote "$BIN")" "$(quote "$name")"
+  if [[ $external_managed == yes ]]; then printf '%s\n' '--無法移除（VPN App 管理路由） | disabled=true'
+  else printf -- '--從清單移除 | bash=%s param1=remove param2=%s terminal=false refresh=true\n' "$(quote "$BIN")" "$(quote "$name")"; fi
 done <<< "$info"
 [[ $targets == 1 ]] || printf '尚未新增網域或 IP | disabled=true\n'
-printf '新增網域或 IP… | bash=%s param1=add terminal=false refresh=true\n' "$(quote "$SELF")"
-printf '編輯清單 | bash=/usr/bin/open param1=-t param2=%s terminal=false\n' "$(quote "$CONF_DIR/hosts.txt")"
+if [[ $external_managed == yes ]]; then
+  printf '%s\n' '新增網域或 IP…（VPN App 管理路由） | disabled=true' '編輯清單（VPN App 管理路由） | disabled=true'
+else
+  printf '新增網域或 IP… | bash=%s param1=add terminal=false refresh=true\n' "$(quote "$SELF")"
+  printf '編輯清單 | bash=/usr/bin/open param1=-t param2=%s terminal=false\n' "$(quote "$CONF_DIR/hosts.txt")"
+fi
 printf '%s\n' '---' '診斷'
 action '--查看連線與分流狀態' status
 action '--測試清單目標的 HTTPS 連線' health
-printf -- '--直連測速（10 MB） | bash=%s param1=speedtest param2=direct terminal=true refresh=true\n' "$(quote "$BIN")"
+if [[ $external_managed == yes ]]; then printf '%s\n' '--直連測速（10 MB，外部 VPN 管理模式停用） | disabled=true'
+else printf -- '--直連測速（10 MB） | bash=%s param1=speedtest param2=direct terminal=true refresh=true\n' "$(quote "$BIN")"; fi
 if [[ $connected == yes && $iface =~ ^utun[0-9]+$ ]]; then
   printf -- '--VPN 測速（10 MB） | bash=%s param1=speedtest param2=vpn terminal=true refresh=true\n' "$(quote "$BIN")"
 else

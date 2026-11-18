@@ -179,6 +179,33 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         line = next(line for line in out.splitlines() if line.startswith("--VPN 測速"))
         self.assertIn("param1=speedtest param2=vpn", line)
 
+    def test_menu_keeps_normal_and_disconnected_controls_enabled(self):
+        for state in (
+            dict(connected="yes", iface="utun7", routing_supported="yes"),
+            dict(connected="no", iface="", routing_supported="no"),
+        ):
+            with self.subTest(state=state):
+                out = self.menu(targets="domain=example.org direct 192.0.2.80\n", **state)
+                for prefix in ("設定為", "新增網域或 IP…", "編輯清單", "--從清單移除", "--直連測速"):
+                    line = next(row for row in out.splitlines() if row.startswith(prefix))
+                    attrs = dict(token.split("=", 1) for token in shlex.split(line.split("|", 1)[1]))
+                    self.assertNotEqual(attrs.get("disabled"), "true", line)
+                    self.assertIn("bash", attrs, line)
+                    self.assertIn("param1", attrs, line)
+                self.assertNotIn("清單目前唯讀", out)
+
+    def test_external_menu_disables_actions_without_command_payloads(self):
+        out = self.menu(targets="domain=example.org vpn 192.0.2.80\n", connected="yes",
+                        iface="utun12", routing_supported="no", daemon="running", applied_mode="split")
+        self.assertNotIn("路由模式：", out)
+        for prefix in ("路由由 VPN App 管理，", "新增網域或 IP…", "編輯清單", "--無法移除", "--直連測速"):
+            line = next(row for row in out.splitlines() if row.startswith(prefix))
+            attrs = dict(token.split("=", 1) for token in shlex.split(line.split("|", 1)[1]))
+            self.assertEqual(attrs, {"disabled": "true"}, line)
+        self.assertIn("--目前走 VPN", out)
+        self.assertIn("--伺服器 IP：192.0.2.80", out)
+        self.assertIn("param1=speedtest param2=vpn", out)
+
     def test_info_reports_provider_for_menu(self):
         self.assertIn("provider=manual\n", self.run_cli("info").stdout)
         self.run_cli("config", "scutil", "Test VPN")
@@ -358,8 +385,18 @@ exit "$exitcode"''')
                               capture_output=True, text=True, timeout=15)
         self.assertEqual(menu.returncode, 0, menu.stderr)
         self.assertIn("VPN：已連線", menu.stdout)
+        lines = menu.stdout.splitlines()
+        for prefix in ("路由由 VPN App 管理，", "新增網域或 IP…", "編輯清單", "--無法移除", "--直連測速"):
+            line = next(line for line in lines if line.startswith(prefix))
+            self.assertIn("disabled=true", line)
+            self.assertNotIn("bash=", line)
+            self.assertNotIn("param1=", line)
+        self.assertIn("清單目前唯讀", menu.stdout)
+        self.assertNotIn("分流：未啟用", menu.stdout)
+        for label in ("--查看連線", "--測試清單", "--VPN 測速", "--檢查設定", "重新整理"):
+            line = next(line for line in lines if line.startswith(label))
+            self.assertNotIn("disabled=true", line)
         self.assertIn("param1=speedtest param2=vpn", menu.stdout)
-        self.assertIn("路由由 VPN App 管理 | disabled=true", menu.stdout)
         self.assertIn("✓ speed.cloudflare.com", menu.stdout)
         out = self.run_cli("speedtest", "vpn").stdout
         self.assertIn("VPN 測速：介面 utun12", out)
