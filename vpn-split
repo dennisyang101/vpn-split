@@ -418,9 +418,46 @@ vpn_probe() {
   valid_ip "$public" && valid_ip "$remote" && [[ $(route_iface "$remote") == "$iface" ]] || return 1
   printf '%s\n' "$public"
 }
+# Observation never grants the routing daemon permission to manage this tunnel.
+observed_iface() {
+  local ips ip iface selected='' details addr
+  ips=$(resolve "$SPEED_HOST") || return 1
+  [[ -n $ips ]] || return 1
+  while IFS= read -r ip; do
+    valid_ip "$ip" || return 1
+    iface=$(route_iface "$ip") || return 1
+    [[ $iface =~ ^utun[0-9]+$ ]] || return 1
+    [[ -z $selected || $selected == "$iface" ]] || return 1
+    selected=$iface
+  done <<< "$ips"
+  details=$(ifconfig "$selected" 2>/dev/null) || return 1
+  [[ ${details%%$'\n'*} == "$selected:"* ]] || return 1
+  grep -q '<UP,' <<< "$details" || return 1
+  while read -r addr; do
+    if valid_ip "$addr"; then printf '%s\n' "$selected"; return 0; fi
+  done < <(awk '$1=="inet" {print $2}' <<< "$details")
+  return 1
+}
+diagnostic_tunnel() {
+  local detected iface status table
+  detected=$(tunnel); status=$?
+  if [[ $status == 0 ]]; then
+    read -r _ iface <<< "$detected"
+    printf 'managed %s\n' "$iface"
+  elif [[ $status == 1 ]]; then
+    # A failed managed tunnel must not be reclassified as an external tunnel.
+    table=$(route_table) || return 1
+    [[ -z $(awk '$1=="0.0.0.0/1" || $1=="128.0.0.0/1" {print}' <<< "$table") && -z $(state_get gw) ]] || return 1
+    iface=$(observed_iface) || return 1
+    printf 'external %s\n' "$iface"
+  else
+    return 1
+  fi
+}
 connected_state() {
-  local result first
-  if tunnel >/dev/null; then printf 'yes\n'; return; fi
+  local iface=${1-} result first
+  if (($# == 0)); then read -r _ iface <<< "$(diagnostic_tunnel)"; fi
+  if [[ -n $iface ]]; then printf 'yes\n'; return; fi
   if [[ $(config_get kind) == scutil ]]; then
     result=$(scutil --nc status "$(config_get service)" 2>/dev/null) || { printf 'unknown\n'; return; }
     IFS= read -r first <<< "$result"
@@ -437,15 +474,18 @@ daemon_running() {
   [[ $process =~ ^[[:space:]]*0[[:space:]] && $process == *" $ROOT_BIN daemon" ]]
 }
 cmd_info() {
-  local detected='' gw='' iface='' public='' remote='' via='' ms='' vpn_ip='' lan host ip
+  local detected iface='' routing_kind=unverified routing_supported=no public='' remote='' via='' ms='' vpn_ip='' lan host ip
   validate_config && entries >/dev/null || return
-  detected=$(tunnel) || :
-  read -r gw iface <<< "$detected" || :
+  if detected=$(diagnostic_tunnel); then
+    read -r routing_kind iface <<< "$detected"
+  fi
+  if [[ $routing_kind == managed ]]; then routing_supported=yes; fi
+  printf 'routing_supported=%s\nrouting_kind=%s\n' "$routing_supported" "$routing_kind"
   read -r public remote via ms <<< "$(probe)" || :
   if [[ -n $iface && $via == "$iface" ]]; then vpn_ip=$public; else vpn_ip=$(vpn_probe "$iface") || :; fi
   lan=$(route_iface default)
   printf 'provider=%s\n' "$(config_get kind)"
-  printf 'connected=%s\niface=%s\nmode=%s\napplied_mode=%s\ndaemon=%s\n' "$(connected_state)" "$iface" "$(mode)" "$(state_get applied | awk 'NF{print; found=1} END{if(!found)print "none"}')" "$(daemon_running && printf running || printf stopped)"
+  printf 'connected=%s\niface=%s\nmode=%s\napplied_mode=%s\ndaemon=%s\n' "$(connected_state "$iface")" "$iface" "$(mode)" "$(state_get applied | awk 'NF{print; found=1} END{if(!found)print "none"}')" "$(daemon_running && printf running || printf stopped)"
   printf 'lan_if=%s\nlan_ip=%s\ncurrent_ip=%s\ncurrent_iface=%s\ncurrent_ms=%s\nvpn_ip=%s\n' "$lan" "$(ipconfig getifaddr "$lan" 2>/dev/null || :)" "$public" "$via" "$ms" "$vpn_ip"
   while IFS= read -r host; do
     if valid_ip "$host" || valid_cidr "$host"; then ip=${host%/*}; else ip=$(resolve "$host" | /usr/bin/head -1); fi
@@ -460,16 +500,20 @@ cmd_info() {
 mode_name() { case $1 in split) printf '分流';; full) printf '全隧道';; *) printf '無';; esac; }
 # Renders cmd_info output. Exit IPs (what remote sites see) are kept apart from listed sites' server IPs.
 render_status() {
-  local info iface current via ms vpn name path ip width=0 mark
+  local info iface routing_kind current via ms vpn name path ip width=0 mark
   info=$(cat)
   get() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' <<< "$info"; }
   iface=$(get iface); current=$(get current_ip); via=$(get current_iface); ms=$(get current_ms); vpn=$(get vpn_ip)
-  if [[ $(get connected) == yes && $(get mode) == "$(get applied_mode)" && $(get daemon) == running ]]; then
+  routing_kind=$(get routing_kind)
+  if [[ $routing_kind == managed && $(get connected) == yes && $(get mode) == "$(get applied_mode)" && $(get daemon) == running ]]; then
     printf '%s：已套用（VPN %s，背景服務運作中）\n' "$(mode_name "$(get mode)")" "$iface"
   else
     case $(get connected) in yes) printf 'VPN：已連線（%s）\n' "$iface";; no) printf 'VPN：未連線\n';; *) printf 'VPN：狀態不明\n';; esac
     printf '模式：想要 %s，目前已套用 %s\n' "$(mode_name "$(get mode)")" "$(mode_name "$(get applied_mode)")"
     printf '背景服務：%s\n' "$([[ $(get daemon) == running ]] && printf 運作中 || printf 未執行)"
+  fi
+  if [[ $routing_kind == external ]]; then
+    printf '路由由 VPN App 管理；vpn-split 僅提供狀態與診斷\n'
   fi
   printf '\n出口 IP（對方看到的你）\n'
   if [[ -z $current ]]; then printf '  目前路徑：取得失敗\n'
@@ -512,11 +556,11 @@ cmd_health() {
   return "$failed"
 }
 speedtest_iface() {
-  local kind route iface
+  local kind route iface detected
   kind=$1
   if [[ $kind == vpn ]]; then
-    route=$(tunnel) || { fail 'VPN 測速需要有效的連線中 utun 隧道'; return 1; }
-    read -r _ iface <<< "$route"
+    detected=$(diagnostic_tunnel) || { fail 'VPN 測速需要有效的連線中 utun 隧道'; return 1; }
+    read -r _ iface <<< "$detected"
   else
     route=$(exact_route 0.0.0.0/0) || return 1
     [[ -n $route && $route != *$'\n'* ]] || { fail "無法確認唯一的直連預設路由 [$route]"; return 1; }

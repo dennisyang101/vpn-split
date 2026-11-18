@@ -103,7 +103,7 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         self.assertIn(attrs["param2"], ("example.org", "192.0.2.0/24"))
 
     def menu(self, targets="", **fields):
-        info = dict(connected="no", iface="", mode="split", applied_mode="none", daemon="stopped",
+        info = dict(connected="no", iface="", routing_kind="unverified", mode="split", applied_mode="none", daemon="stopped",
                     provider="manual", lan_ip="192.0.2.44", current_ip="203.0.113.7", current_iface="en0")
         info.update(fields)
         text = "".join(f"{k}={v}\n" for k, v in info.items()) + targets
@@ -127,7 +127,7 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         self.assertIn("（路徑未確認）", self.menu(current_iface="utun99"))
 
     def test_menu_modes_use_actual_applied_state(self):
-        base = dict(connected="yes", iface="utun7", daemon="running", vpn_ip="198.51.100.99")
+        base = dict(connected="yes", iface="utun7", routing_kind="managed", daemon="running", vpn_ip="198.51.100.99")
         for mode, label, next_mode in (("split", "僅清單目標走 VPN", "full"), ("full", "全部走 VPN", "split")):
             with self.subTest(mode=mode):
                 out = self.menu(**base, mode=mode, applied_mode=mode)
@@ -178,6 +178,38 @@ if [ "$VPN_MODE" = mismatch ]; then printf '128.0/1 10.9.0.1 UGSc utun8\n'; else
         out = self.menu(connected="yes", iface="utun7")
         line = next(line for line in out.splitlines() if line.startswith("--VPN 測速"))
         self.assertIn("param1=speedtest param2=vpn", line)
+
+    def test_menu_keeps_normal_and_disconnected_controls_enabled(self):
+        for state in (
+            dict(connected="yes", iface="utun7", routing_kind="managed"),
+            dict(connected="no", iface="", routing_kind="unverified"),
+        ):
+            with self.subTest(state=state):
+                out = self.menu(targets="domain=example.org direct 192.0.2.80\n", **state)
+                for prefix in ("設定為", "新增網域或 IP…", "編輯清單", "--從清單移除", "--直連測速"):
+                    line = next(row for row in out.splitlines() if row.startswith(prefix))
+                    attrs = dict(token.split("=", 1) for token in shlex.split(line.split("|", 1)[1]))
+                    self.assertNotEqual(attrs.get("disabled"), "true", line)
+                    self.assertIn("bash", attrs, line)
+                    self.assertIn("param1", attrs, line)
+                self.assertNotIn("清單目前唯讀", out)
+
+    def test_external_menu_disables_actions_without_command_payloads(self):
+        out = self.menu(targets="domain=example.org vpn 192.0.2.80\n", connected="yes",
+                        iface="utun12", routing_kind="external", daemon="running", applied_mode="split")
+        self.assertNotIn("路由模式：", out)
+        for prefix in ("路由由 VPN App 管理，", "新增網域或 IP…", "編輯清單", "--無法移除", "--直連測速"):
+            line = next(row for row in out.splitlines() if row.startswith(prefix))
+            attrs = dict(token.split("=", 1) for token in shlex.split(line.split("|", 1)[1]))
+            self.assertEqual(attrs, {"disabled": "true"}, line)
+        self.assertIn("--目前走 VPN", out)
+        self.assertIn("--伺服器 IP：192.0.2.80", out)
+        self.assertIn("param1=speedtest param2=vpn", out)
+
+    def test_menu_requires_cli_with_routing_classification(self):
+        out = self.menu(connected="yes", iface="utun12", routing_kind="", routing_supported="no")
+        self.assertIn("請一併更新 CLI 與選單", out)
+        self.assertNotIn("bash=", out)
 
     def test_info_reports_provider_for_menu(self):
         self.assertIn("provider=manual\n", self.run_cli("info").stdout)
@@ -313,6 +345,133 @@ exit "$SPEED_ROUTE_EXIT"''')
         self.env["CURL_MODE"] = "httpfail"
         self.run_cli("speedtest", ok=False)
 
+    def observed_warp_fixtures(self, **overrides):
+        self.env.update({"VPN_MODE": "none", "WARP_DNS": "198.51.100.21", "WARP_ROUTE_IFACE": "utun12",
+                         "WARP_ROUTE_EXIT": "0", "WARP_IFCONFIG": "up", "CURL_MODE": "probe", **overrides})
+        self.script("dscacheutil", '''printf '%s\\n' "$WARP_DNS" | tr ',' '\\n' | while read ip; do
+ [ -n "$ip" ] && printf 'ip_address: %s\\n' "$ip"
+done''')
+        self.script("route", '''[ "$1 $2" = '-n get' ] || exit 99
+iface=$WARP_ROUTE_IFACE
+case "$3" in 198.51.100.22) iface=utun13;; esac
+printf 'interface: %s\\n' "$iface"
+exit "$WARP_ROUTE_EXIT"''')
+        self.script("ifconfig", '''case "$WARP_IFCONFIG" in
+ missing) exit 1;;
+ down) printf '%s: flags=8010<POINTOPOINT>\\n    inet 192.0.2.22 --> 192.0.2.1\\n' "$1";;
+ ipv6) printf '%s: flags=8051<UP,POINTOPOINT,RUNNING>\\n    inet6 fe80::1\\n' "$1";;
+ *) printf '%s: flags=8051<UP,POINTOPOINT,RUNNING>\\n    inet 192.0.2.22 --> 192.0.2.1\\n' "$1";; esac''')
+
+    def test_info_uses_consistent_warp_state_when_route_changes(self):
+        self.observed_warp_fixtures()
+        self.env["ROUTE_CHANGED"] = str(self.base / "route-changed")
+        self.script("route", '''[ "$1 $2" = '-n get' ] || exit 99
+if [ "$3" = "$WARP_DNS" ] && [ ! -e "$ROUTE_CHANGED" ]; then
+    printf 'interface: utun12\\n'
+    : > "$ROUTE_CHANGED"
+else
+    printf 'interface: en0\\n'
+fi''')
+        info = self.run_cli("info").stdout.splitlines()
+        self.assertIn("routing_supported=no", info)
+        self.assertIn("iface=utun12", info)
+        self.assertIn("connected=yes", info)
+
+    def test_observed_warp_is_diagnostic_only_and_vpn_speedtest_binds_utun(self):
+        self.observed_warp_fixtures()
+        self.run_cli("add", "speed.cloudflare.com")
+        self.env.update(SPEED_OUTPUT="10000000 2.000 198.51.100.8 200 192.0.2.22",
+                        SPEED_CURL_EXIT="0", SPEED_ROUTE_IFACE="utun12", SPEED_ROUTE_EXIT="0",
+                        SPEED_IFCONFIG_EXIT="0", SPEED_DEFAULT="en0", SPEED_CHANGE="no",
+                        SPEED_MARK=str(self.base / "speed-done"))
+        # speed_fixtures supplies the downloader and binding assertions without live networking.
+        self.speed_fixtures()
+        self.env.update(VPN_MODE="none", WARP_DNS="198.51.100.21", WARP_ROUTE_IFACE="utun12",
+                        WARP_ROUTE_EXIT="0", WARP_IFCONFIG="up", SPEED_ROUTE_IFACE="utun12",
+                        SPEED_OUTPUT="10000000 2.000 198.51.100.8 200 10.8.0.2")
+        # Use the WARP interface address as the mocked transfer's local address.
+        self.script("ifconfig", '''case "$1" in utun12) printf 'utun12: flags=8051<UP,POINTOPOINT,RUNNING>\\n inet 10.8.0.2 --> 10.8.0.1\\n';;
+ *) printf 'utun12: flags=8051<UP,POINTOPOINT,RUNNING>\\n inet 10.8.0.2 --> 10.8.0.1\\n';; esac''')
+        self.script("route", '''[ "$1 $2" = '-n get' ] || exit 99
+if [ "$3" = -ifscope ]; then iface=$SPEED_ROUTE_IFACE; exitcode=$SPEED_ROUTE_EXIT
+else iface=$WARP_ROUTE_IFACE; exitcode=$WARP_ROUTE_EXIT; fi
+printf 'interface: %s\\n' "$iface"
+exit "$exitcode"''')
+        info = self.run_cli("info").stdout
+        for field in ("routing_kind=external", "routing_supported=no", "connected=yes", "iface=utun12"):
+            self.assertIn(field + "\n", info)
+        status = self.run_cli("status").stdout
+        self.assertIn("路由由 VPN App 管理", status)
+        self.assertNotIn("已套用（VPN", status)
+        self.env["VPN_SPLIT_BIN"] = str(CLI)
+        menu = subprocess.run([str(ROOT / "vpn-split.1m.sh")], env=self.env,
+                              capture_output=True, text=True, timeout=15)
+        self.assertEqual(menu.returncode, 0, menu.stderr)
+        self.assertIn("VPN：已連線", menu.stdout)
+        lines = menu.stdout.splitlines()
+        for prefix in ("路由由 VPN App 管理，", "新增網域或 IP…", "編輯清單", "--無法移除", "--直連測速"):
+            line = next(line for line in lines if line.startswith(prefix))
+            self.assertIn("disabled=true", line)
+            self.assertNotIn("bash=", line)
+            self.assertNotIn("param1=", line)
+        self.assertIn("清單目前唯讀", menu.stdout)
+        self.assertNotIn("分流：未啟用", menu.stdout)
+        for label in ("--查看連線", "--測試清單", "--VPN 測速", "--檢查設定", "重新整理"):
+            line = next(line for line in lines if line.startswith(label))
+            self.assertNotIn("disabled=true", line)
+        self.assertIn("param1=speedtest param2=vpn", menu.stdout)
+        self.assertIn("✓ speed.cloudflare.com", menu.stdout)
+        out = self.run_cli("speedtest", "vpn").stdout
+        self.assertIn("VPN 測速：介面 utun12", out)
+        args = (self.base / "speed-done").read_text().splitlines()
+        self.assertEqual(args[args.index("--interface") + 1], "if!utun12")
+        self.assertNotIn("sudo", (self.base / "calls").read_text() if (self.base / "calls").exists() else "")
+        calls = (self.base / "calls").read_text() if (self.base / "calls").exists() else ""
+        self.assertNotRegex(calls, r"(?m)^(sudo|launchctl)\b")
+        self.run_cli("connect", ok=False)
+        self.assertNotIn("sudo", (self.base / "calls").read_text() if (self.base / "calls").exists() else "")
+        self.assertEqual(self.source("tunnel", ok=False).returncode, 1)
+        self.assertFalse(self.conf.joinpath("mode").exists())
+
+    def test_observed_warp_rejects_ambiguous_and_unverifiable_paths(self):
+        cases = (
+            {"WARP_ROUTE_IFACE": "en0"},
+            {"WARP_DNS": "198.51.100.21,198.51.100.22", "WARP_ROUTE_IFACE": "utun12"},
+            {"WARP_IFCONFIG": "down"}, {"WARP_IFCONFIG": "missing"},
+            {"WARP_IFCONFIG": "ipv6"}, {"WARP_ROUTE_EXIT": "1"},
+            {"WARP_DNS": ""},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.observed_warp_fixtures(**overrides)
+                info = self.run_cli("info").stdout
+                self.assertIn("routing_kind=unverified\n", info)
+                self.assertIn("routing_supported=no\n", info)
+                self.assertIn("connected=no\n", info)
+                self.assertIn("iface=\n", info)
+                self.source("tunnel", ok=False)
+
+    def test_stale_split_routes_block_observed_fallback(self):
+        self.observed_warp_fixtures()
+        # The legacy parser rejects mismatched /1 halves, but those stale routes still
+        # mean the observed tunnel cannot safely be treated as the current connection.
+        for route_shape in ("mismatch", "supported"):
+            with self.subTest(route_shape=route_shape):
+                self.env["VPN_MODE"] = route_shape
+                info = self.run_cli("info").stdout
+                self.assertIn("routing_kind=unverified\n", info)
+                self.assertIn("routing_supported=no\n", info)
+                self.assertIn("connected=no\n", info)
+                self.assertIn("iface=\n", info)
+                self.source("tunnel", ok=False)
+
+    def test_legacy_managed_tunnel_still_advertises_routing_support(self):
+        self.env["VPN_MODE"] = "supported"
+        info = self.run_cli("info").stdout
+        self.assertIn("routing_kind=managed\n", info)
+        self.assertIn("routing_supported=yes\n", info)
+        self.assertIn("iface=utun7\n", info)
+
     def test_vpn_exit_ip_comes_from_listed_echo_host_through_tunnel(self):
         self.env.update(VPN_MODE="supported", ECHO_IFACE="utun7")
         self.script("curl", '''case "$*" in
@@ -328,7 +487,7 @@ if [ "$3" = 192.0.2.80 ]; then printf 'interface: %s\\n' "$ECHO_IFACE"; else pri
         self.assertIn("vpn_ip=\n", self.run_cli("info").stdout)
 
     def render(self, **fields):
-        info = dict(connected="yes", iface="utun4", mode="split", applied_mode="split", daemon="running",
+        info = dict(connected="yes", iface="utun4", routing_kind="managed", mode="split", applied_mode="split", daemon="running",
                     lan_if="en0", lan_ip="192.0.2.44", current_ip="203.0.113.7", current_iface="en0",
                     current_ms="13", vpn_ip="198.51.100.99")
         info.update(fields)
